@@ -1,0 +1,16 @@
+# Environments
+.env
+.env.example
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Logs
+logs/
+
+# Kilocode config
+.kilocode/mcp.json
+.kiro/settings/mcp.json
