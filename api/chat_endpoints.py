@@ -548,34 +548,27 @@ async def websocket_endpoint(
     Args:
         websocket: WebSocket connection
         user_id: User identifier
-        db: Database session
     """
     await manager.connect(websocket, user_id)
     
     try:
-        # Get database session
+        # Verify user exists (use separate session for this check)
         async with db_manager.get_async_session() as db:
-            # Verify user exists
             user = await get_user_by_id(user_id, db)
-            
-            # Send welcome message
-            welcome_msg = WebSocketMessage(
-                type="status",
-                data={"message": "Connected to chat service", "user_id": user_id},
-                timestamp=datetime.now().isoformat()
-            )
-            await manager.send_message(user_id, welcome_msg)
-            
-            # Initialize RAG components
-            rag_components = await get_rag_components()
-            question_processor, response_generator = rag_components
-            
-            # Initialize database-dependent components
-            vector_search_service = VectorSearchService(db)
-            context_builder = ContextBuilder(vector_search_service)
-            document_repository = DocumentRepository(db, DocumentRepository.get_global_cache())
         
-            while True:
+        # Send welcome message
+        welcome_msg = WebSocketMessage(
+            type="status",
+            data={"message": "Connected to chat service", "user_id": user_id},
+            timestamp=datetime.now().isoformat()
+        )
+        await manager.send_message(user_id, welcome_msg)
+        
+        # Initialize RAG components (these don't need DB sessions)
+        rag_components = await get_rag_components()
+        question_processor, response_generator = rag_components
+        
+        while True:
                 # Receive message from client
                 data = await websocket.receive_text()
                 
@@ -584,6 +577,7 @@ async def websocket_endpoint(
                     
                     if message_data.get("type") == "question":
                         question = message_data.get("question", "").strip()
+                        conversation_id = message_data.get("conversation_id")
                         
                         if not question:
                             error_msg = WebSocketMessage(
@@ -614,74 +608,119 @@ async def websocket_endpoint(
                         
                         start_time = datetime.now()
                         
-                        # Process question using RAG pipeline
-                        processed_question = await question_processor.process_question(
-                            question, user_id
-                        )
-                        
-                        context = await context_builder.build_context(
-                            processed_question, user_id
-                        )
-                        
-                        response = await response_generator.generate_response(
-                            context, user_id
-                        )
-                        
-                        # Save conversation
-                        conversation = ChatConversation(
-                            user_id=user.user_id,
-                            question=question,
-                            response=response.content,
-                            retrieved_doc_ids=[doc.document.doc_id if isinstance(doc.document.doc_id, UUID) else UUID(doc.document.doc_id) for doc in context.retrieved_documents]
-                        )
-                        
-                        db.add(conversation)
-                        await db.commit()
-                        
-                        processing_time = (datetime.now() - start_time).total_seconds()
-                        
-                        # Send response
-                        response_msg = WebSocketMessage(
-                            type="response",
-                            data={
-                                "conversation_id": str(conversation.conversation_id),
-                                "question": question,
-                                "response": response.content,
-                                "processing_time": processing_time,
-                                "confidence_score": response.confidence_score,
-                                "retrieved_doc_count": len(context.retrieved_documents)
-                            },
-                            timestamp=datetime.now().isoformat()
-                        )
-                        await manager.send_message(user_id, response_msg)
+                        # Use a new database session for each message processing
+                        async with db_manager.get_async_session() as db:
+                            try:
+                                # Get user again for this session
+                                user = await get_user_by_id(user_id, db)
+                                
+                                # Initialize database-dependent components for this session
+                                vector_search_service = VectorSearchService(db)
+                                context_builder = ContextBuilder(vector_search_service)
+                                
+                                # Process question using RAG pipeline
+                                processed_question = await question_processor.process_question(
+                                    question, user_id
+                                )
+                                
+                                context = await context_builder.build_context(
+                                    processed_question, user_id
+                                )
+                                
+                                response = await response_generator.generate_response(
+                                    context, user_id
+                                )
+                                
+                                # Save conversation
+                                conversation = ChatConversation(
+                                    user_id=user.user_id,
+                                    question=question,
+                                    response=response.content,
+                                    retrieved_doc_ids=[doc.document.doc_id if isinstance(doc.document.doc_id, UUID) else UUID(doc.document.doc_id) for doc in context.retrieved_documents],
+                                    confidence_score=response.confidence_score,
+                                    processing_time=(datetime.now() - start_time).total_seconds()
+                                )
+                                
+                                db.add(conversation)
+                                await db.commit()
+                                await db.refresh(conversation)
+                                
+                                processing_time = (datetime.now() - start_time).total_seconds()
+                                
+                                # Format retrieved documents for response
+                                retrieved_docs = []
+                                for doc in context.retrieved_documents:
+                                    retrieved_docs.append({
+                                        "id": str(doc.document.doc_id),
+                                        "type": doc.document.doc_type,
+                                        "title": getattr(doc.document, 'title', 'Document'),
+                                        "preview": doc.content_summary[:200] if doc.content_summary else "",
+                                        "relevance_score": doc.relevance_score
+                                    })
+                                
+                                # Send response
+                                response_msg = WebSocketMessage(
+                                    type="response",
+                                    data={
+                                        "conversation_id": str(conversation.conversation_id),
+                                        "response": response.content,
+                                        "retrieved_documents": retrieved_docs,
+                                        "confidence_score": response.confidence_score,
+                                        "processing_time": processing_time,
+                                        "timestamp": conversation.created_at.isoformat()
+                                    },
+                                    timestamp=datetime.now().isoformat()
+                                )
+                                await manager.send_message(user_id, response_msg)
+                                
+                            except Exception as e:
+                                logger.error(f"Error processing question for user {user_id}: {e}")
+                                error_msg = WebSocketMessage(
+                                    type="error",
+                                    data={"message": "질문 처리 중 오류가 발생했습니다. 다시 시도해 주세요."},
+                                    timestamp=datetime.now().isoformat()
+                                )
+                                await manager.send_message(user_id, error_msg)
 
                     elif message_data.get("type") == "feedback":
                         # Accept feedback over websocket
-                        try:
-                            payload = message_data.get("data", {})
-                            feedback = ChatFeedback(
-                                conversation_id=UUID(payload.get("conversation_id")),
-                                user_id=user.user_id,
-                                rating=payload.get("rating"),
-                                helpful=payload.get("helpful"),
-                                comment=payload.get("comment"),
-                                tags=payload.get("tags") or []
-                            )
-                            db.add(feedback)
-                            await db.commit()
-                            ack = WebSocketMessage(
-                                type="status",
-                                data={"message": "Feedback received"},
-                                timestamp=datetime.now().isoformat()
-                            )
-                            await manager.send_message(user_id, ack)
-                        except Exception as e:
-                            err = WebSocketMessage(
-                                type="error",
-                                data={"error": f"Feedback error: {str(e)}"},
-                                timestamp=datetime.now().isoformat()
-                            )
-                            await manager.send_message(user_id, err)
+                        async with db_manager.get_async_session() as db:
+                            try:
+                                user = await get_user_by_id(user_id, db)
+                                payload = message_data.get("data", {})
+                                feedback = ChatFeedback(
+                                    conversation_id=UUID(payload.get("conversation_id")),
+                                    user_id=user.user_id,
+                                    rating=payload.get("rating"),
+                                    helpful=payload.get("helpful"),
+                                    comment=payload.get("comment"),
+                                    tags=payload.get("tags") or []
+                                )
+                                db.add(feedback)
+                                await db.commit()
+                                ack = WebSocketMessage(
+                                    type="status",
+                                    data={"message": "Feedback received"},
+                                    timestamp=datetime.now().isoformat()
+                                )
+                                await manager.send_message(user_id, ack)
+                            except Exception as e:
+                                logger.error(f"Feedback error for user {user_id}: {e}")
+                                err = WebSocketMessage(
+                                    type="error",
+                                    data={"error": f"Feedback error: {str(e)}"},
+                                    timestamp=datetime.now().isoformat()
+                                )
+                                await manager.send_message(user_id, err)
+                    
+                    elif message_data.get("type") == "ping":
+                        # Handle ping messages for heartbeat
+                        pong_msg = WebSocketMessage(
+                            type="pong",
+                            data={"message": "pong"},
+                            timestamp=datetime.now().isoformat()
+                        )
+                        await manager.send_message(user_id, pong_msg)
                         
                     else:
                         error_msg = WebSocketMessage(

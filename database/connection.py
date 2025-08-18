@@ -163,7 +163,10 @@ db_manager = DatabaseManager()
 
 # Convenience functions for getting sessions
 async def get_async_session() -> AsyncSession:
-    """Get async database session"""
+    """Get async database session - WARNING: Must be manually closed!
+    
+    Prefer using db_manager.get_async_session() context manager instead.
+    """
     session_factory = db_manager.get_async_session_factory()
     return session_factory()
 

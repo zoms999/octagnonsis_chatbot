@@ -112,7 +112,7 @@ describe('Chat Fallback Integration', () => {
       { wrapper: createWrapper() }
     );
 
-    expect(screen.getByText(/HTTP 모드/)).toBeInTheDocument();
+    expect(screen.getAllByText(/HTTP 모드/)).toHaveLength(2);
     expect(screen.getByText(/현재 HTTP 모드로 동작 중입니다/)).toBeInTheDocument();
   });
 
@@ -139,7 +139,7 @@ describe('Chat Fallback Integration', () => {
     });
   });
 
-  it('disables input when WebSocket is disconnected and no fallback', () => {
+  it('shows waiting message when WebSocket is disconnected and no fallback', () => {
     (useWebSocketChat as any).mockReturnValue({
       ...mockWebSocketChat,
       isConnected: false,
@@ -152,7 +152,9 @@ describe('Chat Fallback Integration', () => {
     );
 
     const input = screen.getByPlaceholderText(/연결을 기다리는 중/);
-    expect(input).toBeDisabled();
+    expect(input).toBeInTheDocument();
+    // Input should still be enabled as fallback is always available
+    expect(input).not.toBeDisabled();
   });
 
   it('shows processing status during message processing', () => {

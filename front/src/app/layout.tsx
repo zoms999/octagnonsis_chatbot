@@ -5,6 +5,8 @@ import ReactQueryProvider from '@/providers/react-query-provider';
 import { AuthProvider } from '@/providers/auth-provider';
 import { ToastProvider } from '@/providers/toast-provider';
 import ErrorBoundary from '@/components/error/error-boundary';
+import ChunkErrorBoundary from '@/components/error/chunk-error-boundary';
+import { FloatingChunkStatus } from '@/components/error/chunk-status-indicator';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -28,15 +30,18 @@ export default function RootLayout({
   return (
     <html lang="ko" className="h-full">
       <body className={`${inter.className} h-full antialiased`}>
-        <ErrorBoundary>
-          <ReactQueryProvider>
-            <AuthProvider>
-              <ToastProvider>
-                {children}
-              </ToastProvider>
-            </AuthProvider>
-          </ReactQueryProvider>
-        </ErrorBoundary>
+        <ChunkErrorBoundary>
+          <ErrorBoundary>
+            <ReactQueryProvider>
+              <AuthProvider>
+                <ToastProvider>
+                  {children}
+                  <FloatingChunkStatus />
+                </ToastProvider>
+              </AuthProvider>
+            </ReactQueryProvider>
+          </ErrorBoundary>
+        </ChunkErrorBoundary>
       </body>
     </html>
   );

@@ -3,10 +3,8 @@
 import { Suspense } from 'react';
 import { useAuth } from '@/providers/auth-provider';
 import { SimpleLayout } from '@/components/layout';
-import { LazyChatComponents } from '@/components/lazy';
+import { SafeChatContainer } from '@/components/chat/safe-chat-container';
 import { LoadingFallbacks } from '@/lib/lazy-loading';
-
-const { ChatContainer } = LazyChatComponents;
 
 export default function ChatPage() {
   const { user } = useAuth();
@@ -23,9 +21,8 @@ export default function ChatPage() {
 
         <div className="flex-1 bg-card rounded-lg border overflow-hidden">
           <Suspense fallback={<LoadingFallbacks.ChatPage />}>
-            <ChatContainer
+            <SafeChatContainer
               userHasDocuments={true}
-              showDocumentPanel={true}
               className="h-full"
             />
           </Suspense>

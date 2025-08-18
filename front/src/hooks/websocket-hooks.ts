@@ -16,6 +16,7 @@ import {
   EnhancedChatHandler, 
   ChatFallbackConfig 
 } from '@/lib/chat-fallback';
+import { extractUserId } from '@/lib/user-utils';
 
 export function useWebSocket() {
   const { user, getToken } = useAuth();
@@ -24,20 +25,39 @@ export function useWebSocket() {
     reconnectAttempts: 0,
   });
   const clientRef = useRef<WebSocketClient | null>(null);
+  const connectionAttemptRef = useRef<boolean>(false);
+  const lastConnectTimeRef = useRef<number>(0);
 
   const connect = useCallback(async () => {
-    if (!user?.id) {
+    const userId = extractUserId(user);
+    if (!userId) {
       console.warn('Cannot connect WebSocket: No user ID');
       return;
     }
 
+    // Prevent rapid connection attempts
+    const now = Date.now();
+    if (connectionAttemptRef.current || (now - lastConnectTimeRef.current) < 2000) {
+      console.log('Connection attempt already in progress or too recent, skipping');
+      return;
+    }
+
+    connectionAttemptRef.current = true;
+    lastConnectTimeRef.current = now;
+
     try {
       const token = await getToken();
-      const client = getWebSocketClient(user.id);
+      const client = getWebSocketClient(userId);
       clientRef.current = client;
 
       // Subscribe to state changes
-      const unsubscribeState = client.subscribeToState(setState);
+      const unsubscribeState = client.subscribeToState((newState) => {
+        setState(newState);
+        // Reset connection attempt flag when connection succeeds or fails definitively
+        if (newState.status === 'connected' || newState.status === 'error') {
+          connectionAttemptRef.current = false;
+        }
+      });
 
       // Connect with token
       client.connect(token);
@@ -45,22 +65,34 @@ export function useWebSocket() {
       // Cleanup function
       return () => {
         unsubscribeState();
+        connectionAttemptRef.current = false;
       };
     } catch (error) {
       console.error('Failed to connect WebSocket:', error);
+      connectionAttemptRef.current = false;
       setState({
         status: 'error',
         lastError: 'Failed to initialize connection',
         reconnectAttempts: 0,
       });
     }
-  }, [user?.id, getToken]);
+  }, [user, getToken]);
 
   const disconnect = useCallback(() => {
+    connectionAttemptRef.current = false;
     if (clientRef.current) {
       clientRef.current.disconnect();
     }
   }, []);
+
+  const forceReconnect = useCallback(async () => {
+    console.log('Force reconnecting WebSocket');
+    if (clientRef.current) {
+      clientRef.current.reset();
+    }
+    connectionAttemptRef.current = false;
+    await connect();
+  }, [connect]);
 
   const send = useCallback((message: WebSocketMessage) => {
     if (clientRef.current) {
@@ -70,22 +102,30 @@ export function useWebSocket() {
     }
   }, []);
 
-  // Auto-connect when user is available
+  // Auto-connect when user is available - prevent connection loops
   useEffect(() => {
-    if (user?.id) {
-      const cleanup = connect();
-      return () => {
-        cleanup?.then(fn => fn?.());
-      };
-    } else {
+    const userId = extractUserId(user);
+    if (userId && (state.status === 'disconnected' || state.status === 'error')) {
+      // Only connect if we're not already connecting and haven't exceeded max attempts
+      if (state.reconnectAttempts < 5) {
+        console.log('Auto-connecting WebSocket for user:', userId);
+        const cleanup = connect();
+        return () => {
+          cleanup?.then(fn => fn?.());
+        };
+      } else {
+        console.log('Max reconnect attempts reached, not auto-connecting');
+      }
+    } else if (!userId) {
       // Reset client when user logs out
+      console.log('User logged out, resetting WebSocket client');
       resetWebSocketClient();
       setState({
         status: 'disconnected',
         reconnectAttempts: 0,
       });
     }
-  }, [user?.id, connect]);
+  }, [user, state.status, state.reconnectAttempts, connect]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -108,11 +148,13 @@ export function useWebSocket() {
     state,
     connect,
     disconnect,
+    forceReconnect,
     send,
     isConnected: state.status === 'connected',
     isConnecting: state.status === 'connecting',
     isDisconnected: state.status === 'disconnected',
     hasError: state.status === 'error',
+    isHealthy: clientRef.current?.isHealthy() || false,
   };
 }
 
@@ -123,6 +165,7 @@ export function useWebSocketSubscription<T = any>(
 ) {
   const { user } = useAuth();
   const handlerRef = useRef(handler);
+  const subscriptionRef = useRef<(() => void) | null>(null);
 
   // Update handler ref when it changes
   useEffect(() => {
@@ -130,22 +173,41 @@ export function useWebSocketSubscription<T = any>(
   }, [handler]);
 
   useEffect(() => {
-    if (!user?.id) return;
+    const userId = extractUserId(user);
+    if (!userId) {
+      // Clean up existing subscription
+      if (subscriptionRef.current) {
+        subscriptionRef.current();
+        subscriptionRef.current = null;
+      }
+      return;
+    }
 
     try {
-      const client = getWebSocketClient(user.id);
+      const client = getWebSocketClient(userId);
       
-      // Wrap handler to use current ref
+      // Wrap handler to use current ref and add error handling
       const wrappedHandler = (message: WebSocketMessage) => {
-        handlerRef.current(message);
+        try {
+          handlerRef.current(message);
+        } catch (error) {
+          console.error(`Error in WebSocket subscription handler for ${eventType}:`, error);
+        }
       };
 
       const unsubscribe = client.subscribe(eventType, wrappedHandler);
-      return unsubscribe;
+      subscriptionRef.current = unsubscribe;
+      
+      return () => {
+        if (subscriptionRef.current) {
+          subscriptionRef.current();
+          subscriptionRef.current = null;
+        }
+      };
     } catch (error) {
       console.error('Failed to subscribe to WebSocket events:', error);
     }
-  }, [eventType, user?.id, ...deps]);
+  }, [eventType, user, ...deps]);
 }
 
 export function useWebSocketChat(
@@ -215,15 +277,15 @@ export function useWebSocketChat(
       chatHandlerRef.current.onWebSocketStatusChange(isConnected);
     }
     
-    // Automatically enable fallback when WebSocket is not connected
-    if (!isConnected && state.status !== 'connecting') {
+    // Only update fallback status when connection state actually changes
+    if (!isConnected && state.status !== 'connecting' && !usedFallback) {
       setUsedFallback(true);
       console.log('WebSocket not connected, enabling fallback mode');
-    } else if (isConnected) {
+    } else if (isConnected && usedFallback) {
       setUsedFallback(false);
       console.log('WebSocket connected, disabling fallback mode');
     }
-  }, [isConnected, state.status]);
+  }, [isConnected, state.status, usedFallback]);
 
   // Handle status messages
   useWebSocketSubscription('status', (message) => {
@@ -259,8 +321,8 @@ export function useWebSocketChat(
   }, []);
 
   const sendQuestion = useCallback(async (question: string, conversationId?: string) => {
-    // Get user ID from either id or user_id field (for backward compatibility)
-    const userId = user?.id || (user as any)?.user_id;
+    // Get user ID using standardized extraction
+    const userId = extractUserId(user);
     
     console.log('useWebSocketChat.sendQuestion called:', {
       question: question.substring(0, 50) + '...',

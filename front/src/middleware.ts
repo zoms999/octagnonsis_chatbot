@@ -70,15 +70,20 @@ function isValidToken(token: string): boolean {
 // Helper function to validate session with backend API
 async function validateSessionWithAPI(token: string): Promise<{ isValid: boolean; shouldLogout: boolean }> {
   try {
+    // Create AbortController for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
     const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      // Add timeout to prevent hanging requests
-      signal: AbortSignal.timeout(5000),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeoutId);
 
     if (response.ok) {
       logMiddlewareAction('Session validation successful', '/api/auth/me');

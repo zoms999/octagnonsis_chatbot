@@ -206,6 +206,8 @@ export class WebSocketMessageHandler {
 
   private rateLimiter: RateLimiter;
   private onRateLimitExceeded?: (timeUntilNext: number) => void;
+  private sentMessageIds: Set<string> = new Set();
+  private messageIdCleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(
     rateLimitConfig?: RateLimitConfig,
@@ -213,6 +215,11 @@ export class WebSocketMessageHandler {
   ) {
     this.rateLimiter = new RateLimiter(rateLimitConfig);
     this.onRateLimitExceeded = onRateLimitExceeded;
+    
+    // Clean up old message IDs every 5 minutes
+    this.messageIdCleanupInterval = setInterval(() => {
+      this.sentMessageIds.clear();
+    }, 5 * 60 * 1000);
   }
 
   // Register message handlers
@@ -269,11 +276,25 @@ export class WebSocketMessageHandler {
     });
   }
 
-  // Send message with rate limiting
+  // Send message with rate limiting and deduplication
   sendMessage(
     message: WebSocketMessage,
     sendFunction: (message: WebSocketMessage) => void
   ): boolean {
+    // Create message ID for deduplication (for question messages)
+    if (message.type === 'question') {
+      const messageId = `${message.data.question}-${message.data.conversation_id || 'new'}`;
+      
+      // Check if we've already sent this message recently
+      if (this.sentMessageIds.has(messageId)) {
+        console.log('Duplicate message detected, skipping:', messageId);
+        return false;
+      }
+      
+      // Mark message as sent
+      this.sentMessageIds.add(messageId);
+    }
+
     // Check rate limit for outgoing messages
     if (message.type === 'question' && !this.rateLimiter.canSendMessage()) {
       const timeUntilNext = this.rateLimiter.getTimeUntilNextMessage();
@@ -341,6 +362,15 @@ export class WebSocketMessageHandler {
     Object.keys(this.handlers).forEach(key => {
       this.handlers[key] = [];
     });
+    
+    // Clear message ID tracking
+    this.sentMessageIds.clear();
+    
+    // Clear cleanup interval
+    if (this.messageIdCleanupInterval) {
+      clearInterval(this.messageIdCleanupInterval);
+      this.messageIdCleanupInterval = null;
+    }
   }
 
   // Get handler count for debugging

@@ -51,24 +51,32 @@ export function ChatInput({
       messageLength: message.trim().length
     });
     
-    if (!message.trim() || disabled || isProcessing || !rateLimitStatus?.canSendMessage) {
+    // Check if we can send message (default to true if no rate limit status)
+    const canSendMessage = rateLimitStatus?.canSendMessage ?? true;
+    
+    if (!message.trim() || disabled || isProcessing || !canSendMessage) {
       console.log('Blocking submit due to conditions:', {
         hasMessage: !!message.trim(),
         disabled,
         isProcessing,
-        canSendMessage: rateLimitStatus?.canSendMessage
+        canSendMessage
       });
       return;
     }
 
-    console.log('Calling onSendMessage with:', message.trim());
-    onSendMessage(message.trim());
+    const messageToSend = message.trim();
+    console.log('Calling onSendMessage with:', messageToSend);
+    
+    // Clear message immediately to prevent double submission
     setMessage('');
     
     // Reset textarea height
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
+    
+    // Send message after clearing input
+    onSendMessage(messageToSend);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -78,13 +86,14 @@ export function ChatInput({
     }
   };
 
-  const isInputDisabled = disabled || isProcessing || !rateLimitStatus?.canSendMessage;
+  const canSendMessage = rateLimitStatus?.canSendMessage ?? true;
+  const isInputDisabled = disabled || isProcessing || !canSendMessage;
   const remainingChars = maxLength - message.length;
 
   return (
     <div className={cn('border-t bg-white p-4', className)}>
       {/* Rate limit warning */}
-      {rateLimitStatus && !rateLimitStatus.canSendMessage && (
+      {rateLimitStatus && !canSendMessage && (
         <div className="mb-3 p-3 bg-yellow-50 border border-yellow-200 rounded-lg" data-testid="rate-limit-message">
           <div className="flex items-center gap-2 text-yellow-800">
             <span className="text-sm">⏳</span>

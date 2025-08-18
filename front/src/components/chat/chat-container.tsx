@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { useWebSocketChat } from '@/hooks/websocket-hooks';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useSimpleChat } from '@/hooks/use-simple-chat-improved';
+import { ChatErrorDisplay } from './chat-error-display';
 import { useAuth } from '@/providers/auth-provider';
 import { useDocumentPanel } from '@/hooks/use-document-panel';
 import { ChatMessageList } from './chat-message-list';
@@ -11,6 +12,10 @@ import { ProcessingStatus } from './processing-status';
 import { DocumentReferencePanel } from './document-reference-panel';
 import { ChatMessage } from '@/lib/types';
 import { cn } from '@/lib/utils';
+import { ChatDebugPanel } from '@/components/debug/chat-debug-panel';
+import { ChatStatusDebug } from '@/components/debug/chat-status-debug';
+import { exposeDebugFunctions, autoDebugOnError } from '@/lib/debug-utils';
+import { extractUserId, getUserIdDebugInfo } from '@/lib/user-utils';
 
 interface ChatContainerProps {
   conversationId?: string;
@@ -19,6 +24,7 @@ interface ChatContainerProps {
   onViewProfile?: () => void;
   showDocumentPanel?: boolean;
   className?: string;
+  debugMode?: boolean;
 }
 
 export function ChatContainer({
@@ -27,23 +33,18 @@ export function ChatContainer({
   onUploadDocuments,
   onViewProfile,
   showDocumentPanel = true,
-  className
+  className,
+  debugMode = false
 }: ChatContainerProps) {
   const { user, isAuthenticated, isLoading } = useAuth();
   
-  // Debug user state
-  useEffect(() => {
-    console.log('ChatContainer auth state:', {
-      user,
-      isAuthenticated,
-      isLoading,
-      userId: user?.id,
-      userName: user?.name
-    });
-  }, [user, isAuthenticated, isLoading]);
+  // Improved state management for better response handling
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [currentConversationId, setCurrentConversationId] = useState(conversationId);
   const [typingStatus, setTypingStatus] = useState<'processing' | 'generating' | 'complete'>('processing');
+  const [isProcessingMessage, setIsProcessingMessage] = useState(false);
+  const lastProcessedMessageRef = useRef<string | null>(null);
+  const messageIdsRef = useRef<Set<string>>(new Set());
   
   // Document panel management
   const documentPanel = useDocumentPanel({
@@ -54,80 +55,132 @@ export function ChatContainer({
   const {
     sendQuestion,
     isProcessing,
-    lastResponse,
+    lastMessage,
     lastError,
-    connectionState,
-    isConnected,
-    rateLimitStatus,
-    usedFallback,
-    fallbackStatus
-  } = useWebSocketChat(
-    {
-      maxMessages: 10,
-      windowMs: 60000, // 1 minute
-    },
-    {
-      maxRetries: 3,
-      retryDelay: 1000,
-      timeout: 5000,
-    }
-  );
+    clearError,
+    isReady,
+    currentError,
+    isShowingError,
+    dismissError,
+    retryLastAction
+  } = useSimpleChat({
+    enableDebugLogging: true,
+    timeout: 30000,
+    maxRetries: 2,
+    retryDelay: 1000,
+    autoResetError: true,
+    errorResetDelay: 5000
+  });
 
-  // Handle new responses
+  // Debug user state with enhanced logging - moved after useSimpleChat
   useEffect(() => {
-    console.log('ChatContainer: lastResponse changed:', lastResponse);
-    if (lastResponse) {
-      console.log('ChatContainer: Processing new response:', {
-        response: lastResponse.response?.substring(0, 100) + '...',
-        conversationId: lastResponse.conversation_id,
-        retrievedDocs: lastResponse.retrieved_documents?.length
-      });
+    const userIdDebug = getUserIdDebugInfo(user);
+    
+    console.group('🔍 ChatContainer Auth State Debug');
+    console.log('📊 Auth Status:', {
+      isAuthenticated,
+      isLoading,
+      hasUser: userIdDebug.hasUser,
+      isReady
+    });
+    console.log('👤 User Object:', user);
+    console.log('🆔 User ID Debug:', userIdDebug);
+    console.log('📛 User Name:', user?.name);
+    console.log('🏷️ User Type:', user?.type);
+    console.log('🚀 Chat Ready:', isReady);
+    console.groupEnd();
+    
+    // Expose debug functions in development mode
+    if (process.env.NODE_ENV === 'development' && user) {
+      exposeDebugFunctions(user);
+    }
+  }, [user, isAuthenticated, isLoading, isReady]);
 
-      const responseMessage: ChatMessage = {
-        id: `response-${Date.now()}`,
-        type: 'assistant',
-        content: lastResponse.response,
-        timestamp: new Date(),
-        confidence_score: lastResponse.confidence_score,
-        processing_time: lastResponse.processing_time,
-        retrieved_documents: lastResponse.retrieved_documents,
-        conversation_id: lastResponse.conversation_id,
-      };
+  // Improved message handling with better deduplication
+  useEffect(() => {
+    console.log('ChatContainer: lastMessage changed:', lastMessage);
+    if (!lastMessage) return;
 
-      console.log('ChatContainer: Adding response message to list:', responseMessage);
+    // Create a reliable message ID for deduplication
+    const messageId = lastMessage.id || `${lastMessage.type}-${lastMessage.conversation_id || 'no-conv'}-${lastMessage.timestamp.getTime()}`;
+    
+    // Check if we've already processed this exact message
+    if (lastProcessedMessageRef.current === messageId || messageIdsRef.current.has(messageId)) {
+      console.log('ChatContainer: Duplicate message detected, skipping:', messageId);
+      return;
+    }
+
+    console.log('ChatContainer: Processing new message:', {
+      messageId,
+      type: lastMessage.type,
+      content: lastMessage.content?.substring(0, 100) + '...',
+      conversationId: lastMessage.conversation_id,
+      retrievedDocs: lastMessage.retrieved_documents?.length
+    });
+
+    // Mark this message as processed
+    lastProcessedMessageRef.current = messageId;
+    messageIdsRef.current.add(messageId);
+
+    // Process the message based on type
+    if (lastMessage.type === 'assistant') {
+      // This is a response from the API - add it to messages
       setMessages(prev => {
-        const newMessages = [...prev, responseMessage];
-        console.log('ChatContainer: New messages array length:', newMessages.length);
+        // Final check to prevent duplicates
+        const existingMessage = prev.find(msg => 
+          msg.id === lastMessage.id || 
+          (msg.type === lastMessage.type && 
+           msg.content === lastMessage.content &&
+           Math.abs(msg.timestamp.getTime() - lastMessage.timestamp.getTime()) < 2000)
+        );
+        
+        if (existingMessage) {
+          console.log('ChatContainer: Message already exists in list, skipping');
+          return prev;
+        }
+        
+        const newMessages = [...prev, lastMessage];
+        console.log('ChatContainer: Added assistant message. Total messages:', newMessages.length);
         return newMessages;
       });
-      setCurrentConversationId(lastResponse.conversation_id);
+      
+      // Update conversation ID if provided
+      if (lastMessage.conversation_id && lastMessage.conversation_id !== currentConversationId) {
+        console.log('ChatContainer: Updating conversation ID:', lastMessage.conversation_id);
+        setCurrentConversationId(lastMessage.conversation_id);
+      }
       
       // Update document panel with retrieved documents
-      if (lastResponse.retrieved_documents && showDocumentPanel) {
-        console.log('ChatContainer: Updating document panel with', lastResponse.retrieved_documents.length, 'documents');
-        documentPanel.updateDocuments(lastResponse.retrieved_documents);
+      if (lastMessage.retrieved_documents && showDocumentPanel) {
+        console.log('ChatContainer: Updating document panel with', lastMessage.retrieved_documents.length, 'documents');
+        documentPanel.updateDocuments(lastMessage.retrieved_documents);
       }
     }
-  }, [lastResponse, showDocumentPanel, documentPanel]);
+    
+    // Reset processing state when we receive any message
+    setIsProcessingMessage(false);
+  }, [lastMessage, showDocumentPanel, documentPanel, currentConversationId]);
 
-  // Handle errors
+  // Improved error handling - don't add errors as chat messages
   useEffect(() => {
     if (lastError) {
-      const errorMessage: ChatMessage = {
-        id: `error-${Date.now()}`,
-        type: 'assistant',
-        content: `죄송합니다. 오류가 발생했습니다: ${lastError}`,
-        timestamp: new Date(),
-      };
-
-      setMessages(prev => [...prev, errorMessage]);
+      console.error('ChatContainer: Error occurred:', lastError);
+      
+      // Reset processing state on error
+      setIsProcessingMessage(false);
+      
+      // Auto-debug on error in development mode
+      if (process.env.NODE_ENV === 'development') {
+        autoDebugOnError(user, lastError);
+      }
+      
+      // Don't add error messages to chat - let the UI handle error display
     }
-  }, [lastError]);
+  }, [lastError, user]);
 
   // Update typing status based on processing state
   useEffect(() => {
     if (isProcessing) {
-      // Simulate different processing stages
       setTypingStatus('processing');
       
       const timer1 = setTimeout(() => {
@@ -137,18 +190,35 @@ export function ChatContainer({
       return () => {
         clearTimeout(timer1);
       };
+    } else {
+      setTypingStatus('complete');
     }
   }, [isProcessing]);
 
   const handleSendMessage = useCallback(async (message: string) => {
-    // Get user ID from either id or user_id field (for backward compatibility)
-    const userId = user?.id || (user as any)?.user_id;
+    // Prevent sending if already processing a message
+    if (isProcessingMessage || isProcessing) {
+      console.log('Message send blocked - already processing:', { isProcessingMessage, isProcessing });
+      return;
+    }
+
+    // Check if system is ready
+    if (!isReady) {
+      console.log('System not ready for message sending');
+      return;
+    }
+
+    // Get user ID using standardized extraction
+    const userId = extractUserId(user);
     
-    console.log('handleSendMessage called with:', {
+    console.log('ChatContainer handleSendMessage called with:', {
       message: message.substring(0, 50) + '...',
       userId,
       userHasDocuments,
       currentConversationId,
+      isReady,
+      isProcessingMessage,
+      isProcessing,
       userObject: user
     });
 
@@ -157,9 +227,12 @@ export function ChatContainer({
       return;
     }
 
-    // Add user message to the list
+    // Set processing state to prevent duplicate sends
+    setIsProcessingMessage(true);
+
+    // Add user message to the list immediately
     const userMessage: ChatMessage = {
-      id: `user-${Date.now()}`,
+      id: `user-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
       type: 'user',
       content: message,
       timestamp: new Date(),
@@ -167,17 +240,26 @@ export function ChatContainer({
     };
 
     console.log('Adding user message to list:', userMessage);
+    
+    // Add user message and mark it as processed
+    messageIdsRef.current.add(userMessage.id);
     setMessages(prev => [...prev, userMessage]);
 
-    // Send via WebSocket
+    // Clear any previous errors
+    if (lastError) {
+      clearError();
+    }
+
+    // Send via simplified HTTP handler
     try {
-      console.log('Calling sendQuestion with userId:', userId);
+      console.log('Calling simplified sendQuestion');
       await sendQuestion(message, currentConversationId);
-      console.log('sendQuestion completed');
+      console.log('Simplified sendQuestion completed');
     } catch (error) {
       console.error('Failed to send message:', error);
+      setIsProcessingMessage(false); // Reset on error
     }
-  }, [user, userHasDocuments, currentConversationId, sendQuestion]);
+  }, [user, userHasDocuments, currentConversationId, sendQuestion, isProcessingMessage, isProcessing, isReady, lastError, clearError]);
 
   // Show empty state if user has no documents
   if (!userHasDocuments) {
@@ -200,35 +282,38 @@ export function ChatContainer({
         'flex flex-col flex-1',
         showDocumentPanel && documentPanel.hasDocuments && !documentPanel.isCollapsed && 'mr-80'
       )}>
-        {/* Connection status indicator */}
-        {!isConnected && (
-          <div className={cn(
-            "p-3 border-b",
-            usedFallback ? "bg-blue-50 border-blue-200" : "bg-yellow-50 border-yellow-200"
-          )} data-testid="connection-status">
-            <div className={cn(
-              "flex items-center gap-2",
-              usedFallback ? "text-blue-800" : "text-yellow-800"
-            )}>
-              <div className={cn(
-                "w-2 h-2 rounded-full",
-                usedFallback ? "bg-blue-500" : "bg-yellow-500 animate-pulse"
-              )} />
-              <span className="text-sm">
-                {connectionState.status === 'connecting' 
-                  ? '재연결 중...' 
-                  : usedFallback 
-                    ? 'HTTP 모드로 연결됨' 
-                    : '연결 끊김'
-                }
-              </span>
-            </div>
+        {/* Connection status indicator - simplified for HTTP mode */}
+        <div className="hidden" data-testid="connection-status">
+          {isReady ? 'Ready' : 'Not Ready'}
+        </div>
+
+        {/* Enhanced error display */}
+        {isShowingError && currentError && (
+          <div className="border-b" data-testid="error-display">
+            <ChatErrorDisplay
+              error={currentError}
+              onDismiss={dismissError}
+              onRetry={retryLastAction}
+              compact={true}
+              className="m-3"
+            />
           </div>
         )}
         
-        {/* Connected status indicator */}
-        {isConnected && (
-          <div className="hidden" data-testid="connection-status">Connected</div>
+        {/* Fallback for legacy error display */}
+        {!isShowingError && lastError && (
+          <div className="p-3 bg-red-50 border-b border-red-200" data-testid="legacy-error-display">
+            <div className="text-sm text-red-600 flex items-center justify-between">
+              <span>오류: {lastError}</span>
+              <button 
+                onClick={clearError}
+                className="text-red-400 hover:text-red-600 ml-2"
+                aria-label="오류 메시지 닫기"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
         )}
 
         {/* Processing status */}
@@ -263,23 +348,27 @@ export function ChatContainer({
         {/* Input area */}
         <ChatInput
           onSendMessage={handleSendMessage}
-          disabled={false} // Always enable input - fallback will handle disconnected state
-          isProcessing={isProcessing}
-          rateLimitStatus={rateLimitStatus}
+          disabled={!isReady || isProcessingMessage}
+          isProcessing={isProcessing || isProcessingMessage}
+          rateLimitStatus={{
+            canSendMessage: isReady && !isProcessingMessage,
+            remainingMessages: 100, // Simplified - no actual rate limiting
+            timeUntilNextMessage: 0
+          }}
           placeholder={
-            !isConnected && usedFallback
-              ? '적성 분석에 대해 궁금한 것을 물어보세요... (HTTP 모드)'
-              : !isConnected
-              ? '연결을 기다리는 중...'
+            !isReady
+              ? '로그인이 필요하거나 시스템이 준비 중입니다...'
+              : isProcessingMessage
+              ? '메시지를 처리 중입니다...'
               : '적성 분석에 대해 궁금한 것을 물어보세요...'
           }
         />
 
-        {/* Fallback indicator */}
-        {usedFallback && !isConnected && (
-          <div className="px-4 py-2 bg-blue-50 border-t border-blue-200" data-testid="fallback-mode">
-            <div className="text-xs text-blue-600 text-center">
-              현재 HTTP 모드로 동작 중입니다. 채팅 기능은 정상적으로 사용 가능합니다.
+        {/* HTTP mode indicator */}
+        {isReady && (
+          <div className="px-4 py-2 bg-green-50 border-t border-green-200" data-testid="http-mode">
+            <div className="text-xs text-green-600 text-center">
+              HTTP 모드로 동작 중입니다. 채팅 기능이 정상적으로 사용 가능합니다.
             </div>
           </div>
         )}
@@ -304,6 +393,20 @@ export function ChatContainer({
           className="fixed inset-0 bg-black/50 z-20 lg:hidden"
           onClick={documentPanel.toggleCollapsed}
           aria-hidden="true"
+        />
+      )}
+
+      {/* Debug Panel */}
+      {debugMode && <ChatDebugPanel enabled={true} />}
+      
+      {/* Chat Status Debug - Always show in development */}
+      {process.env.NODE_ENV === 'development' && (
+        <ChatStatusDebug
+          isReady={isReady}
+          isProcessing={isProcessing}
+          lastError={lastError}
+          currentError={currentError}
+          isShowingError={isShowingError}
         />
       )}
     </div>

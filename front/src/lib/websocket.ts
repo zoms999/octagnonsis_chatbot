@@ -60,18 +60,34 @@ export class WebSocketClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private heartbeatInterval = 30000; // 30 seconds
+  private isConnecting = false; // Prevent connection loops
+  private isManuallyDisconnected = false; // Track manual disconnections
+  private connectionId = 0; // Track connection attempts
 
   constructor(url: string) {
     this.url = url;
   }
 
   connect(token?: string): void {
-    if (this.ws?.readyState === WebSocket.CONNECTING || this.ws?.readyState === WebSocket.OPEN) {
-      console.log('WebSocket already connecting or connected');
+    // Prevent connection loops - check if already connecting or connected
+    if (this.isConnecting || this.ws?.readyState === WebSocket.CONNECTING || this.ws?.readyState === WebSocket.OPEN) {
+      console.log('WebSocket already connecting or connected, skipping connection attempt');
       return;
     }
 
-    console.log('Attempting to connect WebSocket to:', this.url);
+    // Clear any existing reconnect timer
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    // Set connecting flag to prevent loops
+    this.isConnecting = true;
+    this.isManuallyDisconnected = false;
+    this.connectionId++;
+    const currentConnectionId = this.connectionId;
+
+    console.log(`Attempting to connect WebSocket to: ${this.url} (connection #${currentConnectionId})`);
     this.updateState({
       status: 'connecting',
       reconnectAttempts: this.reconnectAttempts,
@@ -83,17 +99,33 @@ export class WebSocketClient {
       console.log('WebSocket URL with token:', wsUrl.replace(/token=[^&]+/, 'token=***'));
       this.ws = new WebSocket(wsUrl);
 
-      this.ws.onopen = this.handleOpen.bind(this);
-      this.ws.onmessage = this.handleMessage.bind(this);
-      this.ws.onclose = this.handleClose.bind(this);
-      this.ws.onerror = this.handleError.bind(this);
+      // Bind event handlers with connection ID to prevent stale handlers
+      this.ws.onopen = (event) => this.handleOpen(event, currentConnectionId);
+      this.ws.onmessage = (event) => this.handleMessage(event, currentConnectionId);
+      this.ws.onclose = (event) => this.handleClose(event, currentConnectionId);
+      this.ws.onerror = (event) => this.handleError(event, currentConnectionId);
+
+      // Set a connection timeout
+      setTimeout(() => {
+        if (this.connectionId === currentConnectionId && this.isConnecting && this.ws?.readyState === WebSocket.CONNECTING) {
+          console.warn(`WebSocket connection timeout for connection #${currentConnectionId}`);
+          this.ws?.close();
+          this.handleConnectionTimeout(currentConnectionId);
+        }
+      }, 10000); // 10 second timeout
+
     } catch (error) {
       console.error('Failed to create WebSocket:', error);
-      this.handleError(error as Event);
+      this.isConnecting = false;
+      this.handleError(error as Event, currentConnectionId);
     }
   }
 
   disconnect(): void {
+    console.log('Manually disconnecting WebSocket');
+    this.isManuallyDisconnected = true;
+    this.isConnecting = false;
+
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -170,8 +202,31 @@ export class WebSocketClient {
     };
   }
 
-  private handleOpen(): void {
-    console.log('WebSocket connected');
+  // Reset connection state and force reconnect
+  reset(): void {
+    console.log('Resetting WebSocket client state');
+    this.disconnect();
+    this.reconnectAttempts = 0;
+    this.isConnecting = false;
+    this.isManuallyDisconnected = false;
+    this.connectionId++;
+    this.messageQueue = [];
+  }
+
+  // Check if client is in a healthy state
+  isHealthy(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN && !this.isConnecting;
+  }
+
+  private handleOpen(event: Event, connectionId: number): void {
+    // Ignore events from old connections
+    if (connectionId !== this.connectionId) {
+      console.log(`Ignoring open event from old connection #${connectionId}`);
+      return;
+    }
+
+    console.log(`WebSocket connected (connection #${connectionId})`);
+    this.isConnecting = false;
     this.reconnectAttempts = 0;
     this.reconnectDelay = 1000; // Reset delay
 
@@ -192,41 +247,74 @@ export class WebSocketClient {
     this.startHeartbeat();
   }
 
-  private handleMessage(event: MessageEvent): void {
+  private handleMessage(event: MessageEvent, connectionId: number): void {
+    // Ignore events from old connections
+    if (connectionId !== this.connectionId) {
+      console.log(`Ignoring message event from old connection #${connectionId}`);
+      return;
+    }
+
     try {
       const message: WebSocketMessage = JSON.parse(event.data);
+      
+      // Handle pong responses for heartbeat
+      if (message.type === 'pong') {
+        console.log('Received pong response');
+        return;
+      }
       
       // Notify listeners for this message type
       const listeners = this.listeners.get(message.type);
       if (listeners) {
-        listeners.forEach(callback => callback(message));
+        listeners.forEach(callback => {
+          try {
+            callback(message);
+          } catch (error) {
+            console.error(`Error in message listener for ${message.type}:`, error);
+          }
+        });
       }
 
       // Notify listeners for all messages
       const allListeners = this.listeners.get('*');
       if (allListeners) {
-        allListeners.forEach(callback => callback(message));
+        allListeners.forEach(callback => {
+          try {
+            callback(message);
+          } catch (error) {
+            console.error('Error in wildcard message listener:', error);
+          }
+        });
       }
     } catch (error) {
       console.error('Failed to parse WebSocket message:', error);
     }
   }
 
-  private handleClose(event: CloseEvent): void {
-    console.log('WebSocket closed:', {
+  private handleClose(event: CloseEvent, connectionId: number): void {
+    // Ignore events from old connections
+    if (connectionId !== this.connectionId) {
+      console.log(`Ignoring close event from old connection #${connectionId}`);
+      return;
+    }
+
+    console.log(`WebSocket closed (connection #${connectionId}):`, {
       code: event.code,
       reason: event.reason,
       wasClean: event.wasClean,
-      url: this.url
+      url: this.url,
+      isManuallyDisconnected: this.isManuallyDisconnected
     });
+    
+    this.isConnecting = false;
     
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
 
-    // Don't reconnect if it was a normal closure
-    if (event.code === 1000) {
+    // Don't reconnect if it was a manual disconnection or normal closure
+    if (this.isManuallyDisconnected || event.code === 1000) {
       this.updateState({
         status: 'disconnected',
         reconnectAttempts: this.reconnectAttempts,
@@ -234,25 +322,38 @@ export class WebSocketClient {
       return;
     }
 
-    // Attempt reconnection with exponential backoff
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+    // Handle different close codes with appropriate responses
+    const shouldReconnect = this.shouldAttemptReconnect(event.code);
+    
+    if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
       this.scheduleReconnect();
     } else {
+      const errorMessage = this.getCloseErrorMessage(event.code);
       this.updateState({
         status: 'error',
-        lastError: 'Max reconnection attempts reached',
+        lastError: errorMessage,
         reconnectAttempts: this.reconnectAttempts,
       });
     }
   }
 
-  private handleError(event: Event): void {
-    console.error('WebSocket error:', {
+  private handleError(event: Event, connectionId: number): void {
+    // Ignore events from old connections
+    if (connectionId !== this.connectionId) {
+      console.log(`Ignoring error event from old connection #${connectionId}`);
+      return;
+    }
+
+    console.error(`WebSocket error (connection #${connectionId}):`, {
       event,
       url: this.url,
       readyState: this.ws?.readyState,
-      reconnectAttempts: this.reconnectAttempts
+      reconnectAttempts: this.reconnectAttempts,
+      isConnecting: this.isConnecting
     });
+    
+    this.isConnecting = false;
+    
     this.updateState({
       status: 'error',
       lastError: 'Connection error',
@@ -261,8 +362,10 @@ export class WebSocketClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
+    // Prevent multiple reconnect timers and manual disconnections
+    if (this.reconnectTimer || this.isManuallyDisconnected || this.isConnecting) {
+      console.log('Reconnect already scheduled or manually disconnected, skipping');
+      return;
     }
 
     this.reconnectAttempts++;
@@ -271,7 +374,7 @@ export class WebSocketClient {
       this.maxReconnectDelay
     );
 
-    console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    console.log(`Scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     this.updateState({
       status: 'connecting',
@@ -279,7 +382,15 @@ export class WebSocketClient {
     });
 
     this.reconnectTimer = setTimeout(() => {
-      this.connect();
+      this.reconnectTimer = null; // Clear timer reference
+      
+      // Double-check we should still reconnect
+      if (!this.isManuallyDisconnected && this.reconnectAttempts <= this.maxReconnectAttempts) {
+        console.log(`Executing reconnect attempt ${this.reconnectAttempts}`);
+        this.connect();
+      } else {
+        console.log('Skipping reconnect - manually disconnected or max attempts reached');
+      }
     }, delay);
   }
 
@@ -299,8 +410,72 @@ export class WebSocketClient {
     }, this.heartbeatInterval);
   }
 
+  private handleConnectionTimeout(connectionId: number): void {
+    if (connectionId !== this.connectionId) {
+      return;
+    }
+
+    console.error(`WebSocket connection timeout (connection #${connectionId})`);
+    this.isConnecting = false;
+    
+    this.updateState({
+      status: 'error',
+      lastError: 'Connection timeout',
+      reconnectAttempts: this.reconnectAttempts,
+    });
+
+    // Schedule reconnect if not manually disconnected
+    if (!this.isManuallyDisconnected && this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.scheduleReconnect();
+    }
+  }
+
+  private shouldAttemptReconnect(closeCode: number): boolean {
+    // Don't reconnect for certain close codes
+    const noReconnectCodes = [
+      1000, // Normal closure
+      1001, // Going away
+      1005, // No status received
+      4000, // Authentication failed
+      4001, // Unauthorized
+      4003, // Forbidden
+    ];
+
+    return !noReconnectCodes.includes(closeCode);
+  }
+
+  private getCloseErrorMessage(closeCode: number): string {
+    switch (closeCode) {
+      case 1006:
+        return 'Connection lost unexpectedly';
+      case 1011:
+        return 'Server error occurred';
+      case 1012:
+        return 'Server is restarting';
+      case 1013:
+        return 'Server is temporarily unavailable';
+      case 4000:
+        return 'Authentication failed';
+      case 4001:
+        return 'Unauthorized access';
+      case 4003:
+        return 'Access forbidden';
+      default:
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+          return 'Max reconnection attempts reached';
+        }
+        return 'Connection error';
+    }
+  }
+
   private updateState(state: WebSocketState): void {
-    this.stateListeners.forEach(callback => callback(state));
+    this.stateListeners.forEach(callback => {
+      try {
+        callback(state);
+      } catch (error) {
+        console.error('Error in state listener:', error);
+      }
+    });
   }
 }
 
@@ -326,5 +501,19 @@ export function resetWebSocketClient(): void {
   if (globalWebSocketClient) {
     globalWebSocketClient.disconnect();
     globalWebSocketClient = null;
+  }
+}
+
+// Add method to force reconnect
+export function forceReconnectWebSocket(userId?: string): void {
+  if (globalWebSocketClient) {
+    globalWebSocketClient.disconnect();
+    // Wait a bit before reconnecting to ensure clean state
+    setTimeout(() => {
+      if (userId) {
+        const client = getWebSocketClient(userId);
+        client.connect();
+      }
+    }, 1000);
   }
 }

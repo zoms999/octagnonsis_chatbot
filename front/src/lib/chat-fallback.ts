@@ -206,12 +206,8 @@ export class EnhancedChatHandler {
       console.log('WebSocket send function is available, checking connection status...');
     }
 
-    // TEMPORARY: Force HTTP fallback for debugging
-    console.log('TEMPORARY: Forcing HTTP fallback for debugging');
-    this.fallbackHandler.activateFallback();
-
-    // Try WebSocket first if available (disabled for debugging)
-    if (false && !this.fallbackHandler.shouldUseFallback() && webSocketSend) {
+    // Try WebSocket first if available and not forced to use fallback
+    if (!this.fallbackHandler.shouldUseFallback() && webSocketSend) {
       try {
         console.log('Attempting WebSocket send...');
         const message: WebSocketMessage = {

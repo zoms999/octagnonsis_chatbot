@@ -77,7 +77,8 @@ describe('ChatFallbackHandler', () => {
       expect(result.usedFallback).toBe(true);
       expect(ApiClient.sendQuestion).toHaveBeenCalledWith(
         'What is my aptitude?',
-        'conv-123'
+        'conv-123',
+        'user-123'
       );
     });
 
