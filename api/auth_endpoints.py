@@ -559,7 +559,8 @@ async def get_current_user_info(
             row = result.fetchone()
             if row:
                 return {
-                    "user_id": user_id,
+                    "id": user_id,  # Changed from user_id to id for frontend compatibility
+                    "user_id": user_id,  # Keep both for backward compatibility
                     "name": row.pe_name,
                     "ac_id": row.ac_id,
                     "type": user_type,
@@ -592,7 +593,8 @@ async def get_current_user_info(
             row = result.fetchone()
             if row:
                 return {
-                    "user_id": user_id,
+                    "id": user_id,  # Changed from user_id to id for frontend compatibility
+                    "user_id": user_id,  # Keep both for backward compatibility
                     "name": row.name,
                     "ac_id": row.ac_id,
                     "type": user_type
