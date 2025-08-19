@@ -444,6 +444,63 @@ async def save_chunked_documents(session: AsyncSession, user_id: str, documents:
         logger.error(f"Unexpected error saving chunked documents for user {user_id}: {e}")
         raise DocumentRepositoryError(f"Unexpected error: {str(e)}")
 
+    async def get_unique_anp_seqs(self, limit: Optional[int] = None) -> List[int]:
+        """Get list of unique anp_seq values from documents"""
+        try:
+            query = select(ChatDocument.anp_seq).distinct()
+            if limit:
+                query = query.limit(limit)
+            
+            result = await self.session.execute(query)
+            return [row[0] for row in result.fetchall()]
+            
+        except Exception as e:
+            logger.error(f"Error getting unique anp_seqs: {str(e)}")
+            raise DocumentRepositoryError(f"Failed to get unique anp_seqs: {str(e)}")
+
+    async def get_total_user_count(self) -> int:
+        """Get total count of unique users (anp_seq values)"""
+        try:
+            query = select(func.count(func.distinct(ChatDocument.anp_seq)))
+            result = await self.session.execute(query)
+            return result.scalar() or 0
+            
+        except Exception as e:
+            logger.error(f"Error getting total user count: {str(e)}")
+            raise DocumentRepositoryError(f"Failed to get total user count: {str(e)}")
+
+    async def get_users_with_document_type(self, document_type: str) -> List[int]:
+        """Get list of anp_seq values that have documents of specified type"""
+        try:
+            query = select(ChatDocument.anp_seq).distinct().where(
+                ChatDocument.document_type == document_type
+            )
+            
+            result = await self.session.execute(query)
+            return [row[0] for row in result.fetchall()]
+            
+        except Exception as e:
+            logger.error(f"Error getting users with document type {document_type}: {str(e)}")
+            raise DocumentRepositoryError(f"Failed to get users with document type: {str(e)}")
+
+    async def delete_document(self, document_id: UUID) -> bool:
+        """Delete a document by ID"""
+        try:
+            query = delete(ChatDocument).where(ChatDocument.id == document_id)
+            result = await self.session.execute(query)
+            await self.session.commit()
+            
+            # Clear cache
+            if self.cache:
+                await self.cache.invalidate_document(document_id)
+            
+            return result.rowcount > 0
+            
+        except Exception as e:
+            await self.session.rollback()
+            logger.error(f"Error deleting document {document_id}: {str(e)}")
+            raise DocumentRepositoryError(f"Failed to delete document: {str(e)}")
+
 
 async def get_document_repository(session: AsyncSession) -> DocumentRepository:
     """Factory function to create document repository with session"""

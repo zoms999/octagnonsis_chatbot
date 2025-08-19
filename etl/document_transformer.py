@@ -4,6 +4,7 @@ Converts query results into thematic documents optimized for RAG system with sem
 """
 
 import logging
+import time
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,6 +12,7 @@ import json
 from collections import defaultdict
 
 from database.models import DocumentType
+from monitoring.preference_metrics import get_preference_metrics_collector
 
 logger = logging.getLogger(__name__)
 
@@ -617,54 +619,1053 @@ class DocumentTransformer:
         return documents
 
     def _chunk_preference_analysis(self, query_results: Dict[str, List[Dict[str, Any]]]) -> List[TransformedDocument]:
-        """Create preference analysis documents"""
+        """Create enhanced preference analysis documents with intelligent fallback handling"""
+        start_time = time.time()
         documents = []
+        documents_created = 0
+        documents_failed = 0
         
+        # Get metrics collector for monitoring
+        metrics_collector = get_preference_metrics_collector()
+        
+        # Extract all preference-related data
         preference_stats = self._safe_get(query_results.get("imagePreferenceStatsQuery", []))
         preference_data = query_results.get("preferenceDataQuery", [])
+        preference_jobs = query_results.get("preferenceJobsQuery", [])
+        
+        # Track what data is available for intelligent fallback
+        available_data = {
+            "stats": bool(preference_stats and preference_stats.get('total_image_count')),
+            "preferences": bool(preference_data),
+            "jobs": bool(preference_jobs)
+        }
+        
+        # Count available data components
+        available_count = sum(available_data.values())
+        
+        # Calculate data completeness score
+        data_completeness_score = available_count / 3.0
+        
+        # Create documents based on data availability
+        try:
+            if available_count == 0:
+                # No preference data available - create comprehensive fallback document
+                documents.append(self._create_preference_fallback_document(available_data))
+                documents_created = 1
+            elif available_count < 3:
+                # Partial data available - create partial document + available data documents
+                partial_content = {
+                    "stats": preference_stats if available_data["stats"] else None,
+                    "preferences": preference_data if available_data["preferences"] else None,
+                    "jobs": preference_jobs if available_data["jobs"] else None
+                }
+                documents.append(self._create_partial_preference_document(available_data, partial_content))
+                documents_created += 1
+                
+                # Create documents for available data
+                if available_data["stats"]:
+                    stats_docs = self._create_preference_stats_document(preference_stats, available_data)
+                    documents.extend(stats_docs)
+                    documents_created += len(stats_docs)
+                if available_data["preferences"]:
+                    pref_docs = self._create_preference_data_documents(preference_data, available_data)
+                    documents.extend(pref_docs)
+                    documents_created += len(pref_docs)
+                if available_data["jobs"]:
+                    job_docs = self._create_preference_jobs_documents(preference_jobs, available_data)
+                    documents.extend(job_docs)
+                    documents_created += len(job_docs)
+            else:
+                # All data available - create complete documents
+                stats_docs = self._create_preference_stats_document(preference_stats, available_data)
+                documents.extend(stats_docs)
+                documents_created += len(stats_docs)
+                
+                pref_docs = self._create_preference_data_documents(preference_data, available_data)
+                documents.extend(pref_docs)
+                documents_created += len(pref_docs)
+                
+                job_docs = self._create_preference_jobs_documents(preference_jobs, available_data)
+                documents.extend(job_docs)
+                documents_created += len(job_docs)
+                
+                # Add completion summary document
+                documents.append(self._create_preference_completion_summary(preference_stats, preference_data, preference_jobs))
+                documents_created += 1
+                
+            success = True
+            error_message = None
+            
+        except Exception as e:
+            logger.error(f"Error creating preference documents: {e}")
+            documents_failed = 1
+            success = False
+            error_message = str(e)
+            
+            # Create fallback error document
+            documents.append(self._create_preference_error_document(str(e)))
+            documents_created = 1
+        
+        # Record document creation metrics
+        processing_time_ms = (time.time() - start_time) * 1000
+        
+        # Extract anp_seq from query results context if available
+        anp_seq = getattr(self, '_current_anp_seq', 0)  # This would need to be set by the caller
+        
+        # Record metrics asynchronously
+        import asyncio
+        try:
+            asyncio.create_task(metrics_collector.record_document_creation(
+                anp_seq=anp_seq,
+                documents_created=documents_created,
+                documents_failed=documents_failed,
+                total_processing_time_ms=processing_time_ms,
+                data_completeness_score=data_completeness_score,
+                success=success,
+                error_message=error_message
+            ))
+        except Exception as e:
+            logger.warning(f"Failed to record preference document metrics: {e}")
+        
+        return documents
 
-        if preference_stats:
-            summary = f"이미지 선호도 검사 통계: 총 {preference_stats.get('total_image_count')}개 이미지 중 {preference_stats.get('response_count')}개 응답 ({preference_stats.get('response_rate')}%)"
-            documents.append(TransformedDocument(
-                doc_type="PREFERENCE_ANALYSIS",
-                content=preference_stats,
-                summary_text=summary,
-                metadata={"data_sources": ["imagePreferenceStatsQuery"], "created_at": datetime.now().isoformat(), "sub_type": "test_stats"}
-            ))
-        elif preference_data:
-            # 통계는 없지만 선호도 데이터가 있으면 기본 통계 문서 생성
-            documents.append(TransformedDocument(
-                doc_type="PREFERENCE_ANALYSIS",
-                content={"message": "이미지 선호도 검사가 부분적으로 완료되었습니다."},
-                summary_text="이미지 선호도 검사: 부분 완료",
-                metadata={"data_sources": ["preferenceDataQuery"], "created_at": datetime.now().isoformat(), "sub_type": "partial_stats"}
-            ))
+    def _create_preference_error_document(self, error_message: str) -> TransformedDocument:
+        """Create error document when preference processing fails"""
+        content = {
+            "error": True,
+            "message": "선호도 분석 처리 중 오류가 발생했습니다.",
+            "technical_details": error_message,
+            "recommendations": [
+                "잠시 후 다시 시도해 주세요.",
+                "문제가 지속되면 관리자에게 문의하세요."
+            ]
+        }
+        
+        summary_text = "선호도 분석 처리 오류 - 기술적 문제로 인해 선호도 분석을 완료할 수 없습니다."
+        
+        return TransformedDocument(
+            doc_type=DocumentType.PREFERENCE_ANALYSIS.value,
+            content=content,
+            summary_text=summary_text,
+            metadata={
+                "error": True,
+                "timestamp": datetime.now().isoformat(),
+                "processing_status": "failed"
+            }
+        )
+
+    def _create_preference_completion_summary(self, stats: Dict[str, Any], preferences: List[Dict[str, Any]], jobs: List[Dict[str, Any]]) -> TransformedDocument:
+        """Create summary document when all preference data is available"""
+        
+        # Extract key metrics
+        response_rate = stats.get('response_rate', 0) if stats else 0
+        pref_count = len(preferences) if preferences else 0
+        job_count = len(jobs) if jobs else 0
+        
+        # Create comprehensive summary
+        summary_text = f"선호도 분석 완료: {pref_count}개 선호 영역, {job_count}개 추천 직업"
+        if response_rate:
+            summary_text += f" (검사 응답률 {response_rate}%)"
+        
+        # Generate insights
+        insights = []
+        if response_rate >= 80:
+            insights.append("검사가 충분히 완료되어 신뢰할 수 있는 분석 결과입니다.")
+        if pref_count >= 5:
+            insights.append("다양한 선호 영역이 식별되어 폭넓은 관심사를 보여줍니다.")
+        if job_count >= 10:
+            insights.append("많은 직업 옵션이 제시되어 선택의 폭이 넓습니다.")
+        
+        # Get top preferences
+        top_preferences = []
+        if preferences:
+            sorted_prefs = sorted(preferences, key=lambda x: x.get('rank', 999))[:3]
+            top_preferences = [p.get('preference_name', '') for p in sorted_prefs if p.get('preference_name')]
+        
+        content = {
+            "completion_status": "완료",
+            "response_rate": response_rate,
+            "preference_count": pref_count,
+            "job_count": job_count,
+            "top_preferences": top_preferences,
+            "insights": insights,
+            "quality_score": self._calculate_preference_quality_score(response_rate, pref_count, job_count),
+            "recommendation": "모든 선호도 분석 결과를 종합적으로 검토하여 진로 방향을 설정해보세요."
+        }
+        
+        return TransformedDocument(
+            doc_type="PREFERENCE_ANALYSIS",
+            content=content,
+            summary_text=summary_text,
+            metadata={
+                "data_sources": ["imagePreferenceStatsQuery", "preferenceDataQuery", "preferenceJobsQuery"], 
+                "created_at": datetime.now().isoformat(), 
+                "sub_type": "completion_summary",
+                "completion_level": "complete",
+                "quality_score": content["quality_score"]
+            }
+        )
+
+    def _calculate_preference_quality_score(self, response_rate: float, pref_count: int, job_count: int) -> float:
+        """Calculate quality score for preference analysis completeness"""
+        score = 0.0
+        
+        # Response rate component (40% of score)
+        if response_rate >= 90:
+            score += 40
+        elif response_rate >= 80:
+            score += 35
+        elif response_rate >= 70:
+            score += 30
+        elif response_rate >= 50:
+            score += 20
         else:
-            # 선호도 데이터가 없을 때 기본 문서 생성
-            logger.warning("선호도 분석 데이터가 없어 기본 문서를 생성합니다.")
+            score += 10
+        
+        # Preference count component (30% of score)
+        if pref_count >= 8:
+            score += 30
+        elif pref_count >= 5:
+            score += 25
+        elif pref_count >= 3:
+            score += 20
+        elif pref_count >= 1:
+            score += 15
+        
+        # Job count component (30% of score)
+        if job_count >= 15:
+            score += 30
+        elif job_count >= 10:
+            score += 25
+        elif job_count >= 5:
+            score += 20
+        elif job_count >= 1:
+            score += 15
+        
+        return min(score, 100.0)
+
+    def _create_preference_stats_document(self, preference_stats: Dict[str, Any], available_data: Dict[str, bool]) -> List[TransformedDocument]:
+        """Create document for image preference test statistics with enhanced templates"""
+        documents = []
+        
+        if available_data["stats"]:
+            total_count = preference_stats.get('total_image_count', 0)
+            response_count = preference_stats.get('response_count', 0)
+            response_rate = preference_stats.get('response_rate', 0)
+            
+            summary = f"이미지 선호도 검사 통계: 총 {total_count}개 이미지 중 {response_count}개 응답 (응답률 {response_rate}%)"
+            
+            # Enhanced interpretation with actionable insights
+            interpretation = self._generate_stats_interpretation(response_rate, total_count, response_count)
+            
+            # Add recommendations based on completion status
+            recommendations = self._generate_stats_recommendations(response_rate)
+            
+            content = {
+                **preference_stats,
+                "interpretation": interpretation,
+                "recommendations": recommendations,
+                "completion_status": "완료" if response_rate >= 80 else "부분완료" if response_rate >= 50 else "미완료",
+                "quality_indicator": self._get_quality_indicator(response_rate),
+                "next_steps": self._get_stats_next_steps(response_rate)
+            }
+            
             documents.append(TransformedDocument(
                 doc_type="PREFERENCE_ANALYSIS",
-                content={"message": "이미지 선호도 분석 데이터가 아직 준비되지 않았습니다."},
-                summary_text="선호도 분석: 데이터 준비 중",
-                metadata={"data_sources": [], "created_at": datetime.now().isoformat(), "sub_type": "unavailable"}
+                content=content,
+                summary_text=summary,
+                metadata={
+                    "data_sources": ["imagePreferenceStatsQuery"], 
+                    "created_at": datetime.now().isoformat(), 
+                    "sub_type": "test_stats",
+                    "completion_level": "high" if response_rate >= 80 else "medium" if response_rate >= 50 else "low",
+                    "response_rate": response_rate
+                }
             ))
+        
+        return documents
 
-        # Individual preference details
-        for i, pref in enumerate(preference_data):
-            pref_name = pref.get('preference_name')
-            if pref_name:
-                summary = f"{pref_name} 선호도: {i+1}순위, 응답률 {pref.get('response_rate')}%"
-                if pref.get('description'):
-                    summary += f", 설명: {pref['description'][:50]}..."
+    def _generate_stats_interpretation(self, response_rate: float, total_count: int, response_count: int) -> str:
+        """Generate detailed interpretation of test statistics"""
+        if response_rate >= 90:
+            return (f"검사가 매우 충실히 완료되었습니다 ({response_count}/{total_count} 응답). "
+                   "이는 매우 신뢰할 수 있는 선호도 분석 결과를 제공할 수 있으며, "
+                   "개인의 선호 패턴을 정확하게 파악할 수 있습니다.")
+        elif response_rate >= 80:
+            return (f"검사가 충분히 완료되었습니다 ({response_count}/{total_count} 응답). "
+                   "신뢰할 수 있는 선호도 분석 결과를 제공할 수 있으며, "
+                   "주요 선호 경향을 명확하게 식별할 수 있습니다.")
+        elif response_rate >= 60:
+            return (f"검사가 어느 정도 완료되었습니다 ({response_count}/{total_count} 응답). "
+                   "기본적인 선호도 경향을 파악할 수 있지만, "
+                   "더 정확한 분석을 위해서는 추가 응답이 도움이 될 수 있습니다.")
+        elif response_rate >= 40:
+            return (f"검사가 부분적으로 완료되었습니다 ({response_count}/{total_count} 응답). "
+                   "일반적인 선호 방향성은 파악할 수 있지만, "
+                   "세부적인 선호도 분석의 정확도는 제한적일 수 있습니다.")
+        else:
+            return (f"검사 완료도가 낮습니다 ({response_count}/{total_count} 응답). "
+                   "현재 결과로는 선호도 패턴을 정확히 파악하기 어려우며, "
+                   "추가 검사 완료를 권장합니다.")
+
+    def _generate_stats_recommendations(self, response_rate: float) -> List[str]:
+        """Generate recommendations based on response rate"""
+        if response_rate >= 80:
+            return [
+                "선호도 분석 결과를 자세히 검토해보세요",
+                "추천된 직업들과 본인의 관심사를 비교해보세요",
+                "다른 검사 결과와 종합하여 진로 방향을 설정해보세요"
+            ]
+        elif response_rate >= 60:
+            return [
+                "현재 결과를 참고하되, 추가 검사 완료를 고려해보세요",
+                "다른 검사 결과와 함께 종합적으로 판단해보세요",
+                "관심 있는 분야와 현재 결과를 비교해보세요"
+            ]
+        else:
+            return [
+                "검사를 더 완료하여 정확한 선호도 분석을 받아보세요",
+                "현재는 다른 검사 결과를 우선적으로 참고하세요",
+                "성향 분석이나 역량 분석 결과를 먼저 확인해보세요"
+            ]
+
+    def _get_quality_indicator(self, response_rate: float) -> str:
+        """Get quality indicator based on response rate"""
+        if response_rate >= 90:
+            return "🟢 매우 높음"
+        elif response_rate >= 80:
+            return "🟢 높음"
+        elif response_rate >= 60:
+            return "🟡 보통"
+        elif response_rate >= 40:
+            return "🟠 낮음"
+        else:
+            return "🔴 매우 낮음"
+
+    def _get_stats_next_steps(self, response_rate: float) -> List[str]:
+        """Get next steps based on response rate"""
+        if response_rate >= 80:
+            return [
+                "선호도 분석 상세 결과 확인",
+                "추천 직업 목록 검토",
+                "다른 검사 결과와 비교 분석"
+            ]
+        elif response_rate >= 60:
+            return [
+                "현재 선호도 결과 검토",
+                "추가 검사 완료 고려",
+                "성향 분석 결과와 비교"
+            ]
+        else:
+            return [
+                "검사 추가 완료",
+                "다른 검사 결과 우선 확인",
+                "성향 기반 직업 추천 검토"
+            ]
+
+    def _create_preference_data_documents(self, preference_data: List[Dict[str, Any]], available_data: Dict[str, bool]) -> List[TransformedDocument]:
+        """Create enhanced documents for individual preference analysis results"""
+        documents = []
+        
+        if available_data["preferences"]:
+            # Create comprehensive overview document
+            pref_names = [pref.get('preference_name', '') for pref in preference_data[:3] 
+                         if pref and pref.get('preference_name')]
+            
+            if pref_names:
+                overview_summary = f"선호도 분석 결과: {', '.join(pref_names)} 등 {len(preference_data)}개 선호 영역"
+            else:
+                overview_summary = f"선호도 분석 결과: {len(preference_data)}개 선호 영역"
+            
+            # Generate insights about preference patterns
+            insights = self._generate_preference_insights(preference_data)
+            
+            documents.append(TransformedDocument(
+                doc_type="PREFERENCE_ANALYSIS",
+                content={
+                    "preferences_overview": preference_data,
+                    "total_preferences": len(preference_data),
+                    "top_preferences": pref_names,
+                    "insights": insights,
+                    "preference_distribution": self._analyze_preference_distribution(preference_data),
+                    "recommendations": self._generate_preference_overview_recommendations(preference_data)
+                },
+                summary_text=overview_summary,
+                metadata={
+                    "data_sources": ["preferenceDataQuery"], 
+                    "created_at": datetime.now().isoformat(), 
+                    "sub_type": "preferences_overview",
+                    "completion_level": "high",
+                    "preference_count": len(preference_data)
+                }
+            ))
+            
+            # Create enhanced individual preference documents
+            for i, pref in enumerate(preference_data):
+                if not pref:  # Skip None objects
+                    continue
+                pref_name = pref.get('preference_name')
+                if pref_name and pref_name.strip():  # Check for non-empty name
+                    rank = pref.get('rank', i + 1)
+                    response_rate = pref.get('response_rate', 0)
+                    description = pref.get('description', '')
+                    
+                    summary = f"{pref_name} 선호도: {rank}순위"
+                    if response_rate:
+                        summary += f", 응답률 {response_rate}%"
+                    
+                    # Enhanced analysis with career implications
+                    analysis = self._generate_detailed_preference_analysis(pref_name, rank, description)
+                    
+                    # Career and development suggestions
+                    career_implications = self._generate_career_implications(pref_name, rank)
+                    
+                    content = {
+                        **pref,
+                        "rank": rank,
+                        "analysis": analysis,
+                        "career_implications": career_implications,
+                        "preference_strength": "강함" if rank == 1 else "보통" if rank <= 3 else "약함",
+                        "development_suggestions": self._generate_development_suggestions(pref_name, rank),
+                        "related_activities": self._suggest_related_activities(pref_name)
+                    }
+                    
+                    documents.append(TransformedDocument(
+                        doc_type="PREFERENCE_ANALYSIS",
+                        content=content,
+                        summary_text=summary,
+                        metadata={
+                            "data_sources": ["preferenceDataQuery"], 
+                            "created_at": datetime.now().isoformat(), 
+                            "sub_type": f"preference_{rank}",
+                            "preference_name": pref_name,
+                            "completion_level": "high",
+                            "rank": rank
+                        }
+                    ))
+        
+        return documents
+
+    def _generate_preference_insights(self, preference_data: List[Dict[str, Any]]) -> List[str]:
+        """Generate insights about overall preference patterns"""
+        insights = []
+        
+        # Filter out None objects first
+        valid_preferences = [p for p in preference_data if p is not None]
+        
+        if len(valid_preferences) >= 8:
+            insights.append("다양한 선호 영역이 식별되어 폭넓은 관심사와 적응력을 보여줍니다.")
+        elif len(valid_preferences) >= 5:
+            insights.append("적절한 수의 선호 영역이 있어 균형잡힌 관심사를 나타냅니다.")
+        else:
+            insights.append("명확한 선호 영역이 있어 집중적인 관심사를 보여줍니다.")
+        
+        # Analyze top preferences - handle None ranks
+        top_prefs = sorted(valid_preferences, key=lambda x: x.get('rank') if x.get('rank') is not None else 999)[:3]
+        if top_prefs:
+            top_names = [p.get('preference_name', '') for p in top_prefs if p.get('preference_name')]
+            if len(top_names) >= 2:
+                insights.append(f"상위 선호도인 '{top_names[0]}'와 '{top_names[1]}'이 주요 관심 영역입니다.")
+        
+        return insights
+
+    def _analyze_preference_distribution(self, preference_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Analyze the distribution of preference strengths"""
+        # Filter out None objects first
+        valid_preferences = [p for p in preference_data if p is not None]
+        
+        strong_prefs = len([p for p in valid_preferences if (p.get('rank') or 999) <= 2])
+        medium_prefs = len([p for p in valid_preferences if 3 <= (p.get('rank') or 999) <= 5])
+        weak_prefs = len([p for p in valid_preferences if (p.get('rank') or 999) > 5])
+        
+        return {
+            "strong_preferences": strong_prefs,
+            "medium_preferences": medium_prefs,
+            "weak_preferences": weak_prefs,
+            "total_preferences": len(valid_preferences),
+            "concentration_level": "집중형" if strong_prefs >= 3 else "균형형" if medium_prefs >= 3 else "분산형"
+        }
+
+    def _generate_preference_overview_recommendations(self, preference_data: List[Dict[str, Any]]) -> List[str]:
+        """Generate recommendations based on overall preference pattern"""
+        recommendations = []
+        
+        # Filter out None objects first
+        valid_preferences = [p for p in preference_data if p is not None]
+        
+        top_prefs = sorted(valid_preferences, key=lambda x: x.get('rank') if x.get('rank') is not None else 999)[:3]
+        if top_prefs:
+            recommendations.append("상위 선호도 영역을 중심으로 진로 방향을 설정해보세요.")
+            recommendations.append("선호도 기반 직업 추천을 확인하여 구체적인 직업을 탐색해보세요.")
+        
+        if len(valid_preferences) >= 5:
+            recommendations.append("다양한 선호 영역을 활용할 수 있는 융합적 직업도 고려해보세요.")
+        
+        recommendations.append("성향 분석 결과와 비교하여 일치하는 부분을 확인해보세요.")
+        
+        return recommendations
+
+    def _generate_detailed_preference_analysis(self, pref_name: str, rank: int, description: str) -> str:
+        """Generate detailed analysis for individual preferences"""
+        base_analysis = ""
+        
+        if rank == 1:
+            base_analysis = f"'{pref_name}'은 가장 강한 선호를 보이는 영역입니다. "
+            base_analysis += "이는 개인의 핵심적인 관심사이자 동기 요소로 작용할 가능성이 높습니다. "
+        elif rank <= 3:
+            base_analysis = f"'{pref_name}'은 상위 선호 영역 중 하나입니다. "
+            base_analysis += "이 영역에 대한 관심과 적성이 있어 관련 활동에서 만족감을 느낄 수 있습니다. "
+        elif rank <= 5:
+            base_analysis = f"'{pref_name}'은 중간 정도의 선호를 보이는 영역입니다. "
+            base_analysis += "상황에 따라 관심을 가질 수 있는 영역으로, 다른 요소와 결합하여 고려해볼 수 있습니다. "
+        else:
+            base_analysis = f"'{pref_name}'은 상대적으로 낮은 선호를 보이는 영역입니다. "
+            base_analysis += "현재로서는 주요 관심사가 아니지만, 향후 경험을 통해 변화할 수 있습니다. "
+        
+        if description:
+            base_analysis += f"구체적으로는 {description}"
+        
+        return base_analysis
+
+    def _generate_career_implications(self, pref_name: str, rank: int) -> List[str]:
+        """Generate career implications based on preference"""
+        implications = []
+        
+        if rank <= 2:
+            implications.append(f"{pref_name} 관련 직업을 우선적으로 고려해보세요.")
+            implications.append("이 영역에서 전문성을 개발하면 높은 만족도를 얻을 수 있습니다.")
+        elif rank <= 5:
+            implications.append(f"{pref_name} 요소가 포함된 직업을 탐색해보세요.")
+            implications.append("주 업무가 아니더라도 부분적으로 관련된 역할을 찾아보세요.")
+        
+        return implications
+
+    def _generate_development_suggestions(self, pref_name: str, rank: int) -> List[str]:
+        """Generate development suggestions based on preference"""
+        suggestions = []
+        
+        if rank <= 3:
+            suggestions.append(f"{pref_name} 관련 역량을 더욱 발전시켜보세요.")
+            suggestions.append("관련 교육이나 경험 기회를 적극적으로 찾아보세요.")
+            suggestions.append("이 영역의 전문가나 멘토를 찾아 조언을 구해보세요.")
+        else:
+            suggestions.append("다른 강점 영역에 더 집중하는 것을 권장합니다.")
+            suggestions.append("필요시 기본적인 이해 수준으로 학습해보세요.")
+        
+        return suggestions
+
+    def _suggest_related_activities(self, pref_name: str) -> List[str]:
+        """Suggest activities related to the preference"""
+        # This could be enhanced with a more sophisticated mapping
+        activities = []
+        
+        if "실내" in pref_name or "조용" in pref_name:
+            activities.extend(["독서", "연구", "분석 작업", "계획 수립"])
+        elif "창의" in pref_name or "예술" in pref_name:
+            activities.extend(["디자인", "글쓰기", "아이디어 발상", "예술 활동"])
+        elif "사람" in pref_name or "소통" in pref_name:
+            activities.extend(["팀 프로젝트", "발표", "상담", "교육"])
+        elif "야외" in pref_name or "활동" in pref_name:
+            activities.extend(["현장 업무", "체험 활동", "여행", "운동"])
+        else:
+            activities.extend(["관련 체험", "학습", "탐색"])
+        
+        return activities
+
+    def _create_preference_jobs_documents(self, preference_jobs: List[Dict[str, Any]], available_data: Dict[str, bool]) -> List[TransformedDocument]:
+        """Create enhanced documents for preference-based job recommendations"""
+        documents = []
+        
+        if available_data["jobs"]:
+            # Group jobs by preference type
+            jobs_by_preference = {}
+            for job in preference_jobs:
+                if not job:  # Skip None objects
+                    continue
+                pref_type = job.get('preference_type', 'unknown')
+                pref_name = job.get('preference_name')
+                if not pref_name or not pref_name.strip():
+                    pref_name = f'선호도 {pref_type}'
+                
+                if pref_name not in jobs_by_preference:
+                    jobs_by_preference[pref_name] = []
+                jobs_by_preference[pref_name].append(job)
+            
+            # Create overview document for all job recommendations
+            if jobs_by_preference:
+                total_jobs = sum(len(jobs) for jobs in jobs_by_preference.values())
+                pref_types = list(jobs_by_preference.keys())
+                
+                overview_summary = f"선호도 기반 직업 추천: {len(pref_types)}개 선호 영역에서 총 {total_jobs}개 직업"
                 
                 documents.append(TransformedDocument(
                     doc_type="PREFERENCE_ANALYSIS",
-                    content=pref,
-                    summary_text=summary,
-                    metadata={"data_sources": ["preferenceDataQuery"], "created_at": datetime.now().isoformat(), "sub_type": f"preference_{i+1}", "preference_name": pref_name}
+                    content={
+                        "total_jobs": total_jobs,
+                        "preference_types": pref_types,
+                        "jobs_by_preference": jobs_by_preference,
+                        "overview_insights": self._generate_job_overview_insights(jobs_by_preference),
+                        "career_diversity": self._assess_career_diversity(jobs_by_preference),
+                        "recommendations": self._generate_job_overview_recommendations(jobs_by_preference)
+                    },
+                    summary_text=overview_summary,
+                    metadata={
+                        "data_sources": ["preferenceJobsQuery"], 
+                        "created_at": datetime.now().isoformat(), 
+                        "sub_type": "jobs_overview",
+                        "completion_level": "high",
+                        "job_count": total_jobs,
+                        "preference_count": len(pref_types)
+                    }
                 ))
-
+            
+            # Create detailed documents for each preference type
+            for pref_name, jobs in jobs_by_preference.items():
+                job_names = [job.get('jo_name', '') for job in jobs[:3] if job.get('jo_name')]
+                summary = f"{pref_name} 기반 추천 직업: {', '.join(job_names)}"
+                if len(jobs) > 3:
+                    summary += f" 등 {len(jobs)}개"
+                
+                # Enhanced analysis of job recommendations
+                analysis = self._generate_comprehensive_job_analysis(pref_name, jobs)
+                
+                # Career path suggestions
+                career_paths = self._suggest_career_paths(jobs)
+                
+                # Industry analysis
+                industry_analysis = self._analyze_job_industries(jobs)
+                
+                content = {
+                    "preference_name": pref_name,
+                    "jobs": jobs,
+                    "job_count": len(jobs),
+                    "analysis": analysis,
+                    "top_jobs": job_names,
+                    "career_paths": career_paths,
+                    "industry_analysis": industry_analysis,
+                    "skill_requirements": self._extract_skill_requirements(jobs),
+                    "education_recommendations": self._extract_education_recommendations(jobs),
+                    "next_steps": self._suggest_job_exploration_steps(pref_name, jobs)
+                }
+                
+                documents.append(TransformedDocument(
+                    doc_type="PREFERENCE_ANALYSIS",
+                    content=content,
+                    summary_text=summary,
+                    metadata={
+                        "data_sources": ["preferenceJobsQuery"], 
+                        "created_at": datetime.now().isoformat(), 
+                        "sub_type": f"jobs_{pref_name.replace(' ', '_')}",
+                        "preference_name": pref_name,
+                        "completion_level": "high",
+                        "job_count": len(jobs)
+                    }
+                ))
+        
         return documents
+
+    def _generate_job_overview_insights(self, jobs_by_preference: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+        """Generate insights about overall job recommendation patterns"""
+        insights = []
+        
+        total_jobs = sum(len(jobs) for jobs in jobs_by_preference.values())
+        pref_count = len(jobs_by_preference)
+        
+        if total_jobs >= 20:
+            insights.append("매우 다양한 직업 옵션이 제시되어 선택의 폭이 넓습니다.")
+        elif total_jobs >= 10:
+            insights.append("적절한 수의 직업 옵션이 있어 구체적인 탐색이 가능합니다.")
+        else:
+            insights.append("명확한 직업 방향성이 제시되어 집중적인 탐색이 가능합니다.")
+        
+        if pref_count >= 4:
+            insights.append("여러 선호 영역에서 직업이 추천되어 다양한 관심사를 반영합니다.")
+        
+        return insights
+
+    def _assess_career_diversity(self, jobs_by_preference: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """Assess the diversity of career recommendations"""
+        all_jobs = []
+        for jobs in jobs_by_preference.values():
+            all_jobs.extend(jobs)
+        
+        # Extract industries (simplified)
+        industries = set()
+        for job in all_jobs:
+            outline = job.get('jo_outline', '')
+            if outline:
+                industries.add(outline)
+        
+        return {
+            "total_jobs": len(all_jobs),
+            "unique_industries": len(industries),
+            "diversity_score": min(len(industries) / max(len(all_jobs), 1) * 100, 100),
+            "diversity_level": "높음" if len(industries) >= 8 else "보통" if len(industries) >= 4 else "낮음"
+        }
+
+    def _generate_job_overview_recommendations(self, jobs_by_preference: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+        """Generate recommendations for job exploration"""
+        recommendations = []
+        
+        # Find preference with most jobs
+        max_jobs_pref = max(jobs_by_preference.items(), key=lambda x: len(x[1]))
+        recommendations.append(f"'{max_jobs_pref[0]}' 영역에서 가장 많은 직업이 추천되므로 우선적으로 탐색해보세요.")
+        
+        recommendations.extend([
+            "각 선호 영역별 추천 직업을 자세히 검토해보세요.",
+            "관심 있는 직업의 구체적인 업무 내용을 조사해보세요.",
+            "추천 전공과 현재 전공/관심 분야를 비교해보세요.",
+            "성향 기반 직업 추천과 비교하여 일치하는 직업을 찾아보세요."
+        ])
+        
+        return recommendations
+
+    def _generate_comprehensive_job_analysis(self, pref_name: str, jobs: List[Dict[str, Any]]) -> str:
+        """Generate comprehensive analysis of job recommendations for a preference"""
+        analysis = f"'{pref_name}' 선호도를 바탕으로 {len(jobs)}개의 직업이 추천되었습니다. "
+        
+        if len(jobs) >= 8:
+            analysis += "매우 다양한 직업 옵션이 있어 선택의 폭이 넓고, 이 선호도가 여러 분야에서 활용될 수 있음을 보여줍니다. "
+        elif len(jobs) >= 4:
+            analysis += "적절한 수의 직업 옵션이 제공되어 구체적인 진로 탐색이 가능합니다. "
+        else:
+            analysis += "명확한 직업 방향성이 제시되어 집중적인 탐색이 가능합니다. "
+        
+        # Analyze job types
+        job_outlines = [job.get('jo_outline', '') for job in jobs if job.get('jo_outline')]
+        if job_outlines:
+            unique_outlines = set(job_outlines)
+            if len(unique_outlines) >= 5:
+                analysis += "다양한 업무 영역에 걸쳐 추천되어 폭넓은 적용 가능성을 보여줍니다."
+            else:
+                analysis += "특정 업무 영역에 집중되어 명확한 전문성 방향을 제시합니다."
+        
+        return analysis
+
+    def _suggest_career_paths(self, jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Suggest career paths based on job recommendations"""
+        paths = []
+        
+        # Group jobs by similar characteristics
+        job_groups = {}
+        for job in jobs:
+            outline = job.get('jo_outline', '기타')
+            if outline not in job_groups:
+                job_groups[outline] = []
+            job_groups[outline].append(job)
+        
+        for outline, group_jobs in job_groups.items():
+            if len(group_jobs) >= 2:  # Only suggest paths with multiple jobs
+                paths.append({
+                    "path_name": f"{outline} 분야",
+                    "jobs": [job.get('jo_name', '') for job in group_jobs],
+                    "description": f"{outline} 영역에서의 다양한 직업 기회"
+                })
+        
+        return paths
+
+    def _analyze_job_industries(self, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Analyze industries represented in job recommendations"""
+        industries = {}
+        for job in jobs:
+            outline = job.get('jo_outline', '기타')
+            if outline not in industries:
+                industries[outline] = []
+            industries[outline].append(job.get('jo_name', ''))
+        
+        return {
+            "industry_count": len(industries),
+            "industries": industries,
+            "dominant_industry": max(industries.items(), key=lambda x: len(x[1]))[0] if industries else None
+        }
+
+    def _extract_skill_requirements(self, jobs: List[Dict[str, Any]]) -> List[str]:
+        """Extract common skill requirements from job recommendations"""
+        skills = set()
+        
+        for job in jobs:
+            # Extract from job main business
+            main_business = job.get('jo_mainbusiness', '')
+            if main_business:
+                # Simple keyword extraction (could be enhanced)
+                if '분석' in main_business:
+                    skills.add('분석 능력')
+                if '설계' in main_business:
+                    skills.add('설계 능력')
+                if '개발' in main_business:
+                    skills.add('개발 능력')
+                if '관리' in main_business:
+                    skills.add('관리 능력')
+                if '소통' in main_business or '상담' in main_business:
+                    skills.add('소통 능력')
+        
+        return list(skills)
+
+    def _extract_education_recommendations(self, jobs: List[Dict[str, Any]]) -> List[str]:
+        """Extract education recommendations from job data"""
+        majors = set()
+        
+        for job in jobs:
+            major_info = job.get('majors', '')
+            if major_info:
+                # Split by common delimiters
+                for delimiter in [',', '/', '·', '및']:
+                    if delimiter in major_info:
+                        major_parts = major_info.split(delimiter)
+                        for part in major_parts:
+                            clean_major = part.strip()
+                            if clean_major:
+                                majors.add(clean_major)
+                        break
+                else:
+                    majors.add(major_info.strip())
+        
+        return list(majors)
+
+    def _suggest_job_exploration_steps(self, pref_name: str, jobs: List[Dict[str, Any]]) -> List[str]:
+        """Suggest specific steps for exploring these job recommendations"""
+        steps = []
+        
+        if len(jobs) >= 5:
+            steps.append("관심 있는 상위 3-5개 직업을 선별해보세요.")
+        else:
+            steps.append("모든 추천 직업을 자세히 검토해보세요.")
+        
+        steps.extend([
+            "각 직업의 구체적인 업무 내용과 요구 역량을 조사해보세요.",
+            "해당 분야 종사자와의 인터뷰나 멘토링을 고려해보세요.",
+            "관련 교육 과정이나 자격증 정보를 확인해보세요.",
+            "인턴십이나 체험 프로그램 기회를 찾아보세요."
+        ])
+        
+        return steps
+
+    def _create_preference_fallback_document(self, available_data: Dict[str, bool]) -> TransformedDocument:
+        """Create informative fallback document when preference data is missing"""
+        
+        # Determine what specific data is missing and why
+        missing_components = []
+        if not available_data["stats"]:
+            missing_components.append("이미지 선호도 검사 통계")
+        if not available_data["preferences"]:
+            missing_components.append("선호도 분석 결과")
+        if not available_data["jobs"]:
+            missing_components.append("선호도 기반 직업 추천")
+        
+        # Create helpful explanation based on what's missing
+        explanation = self._generate_missing_data_explanation(missing_components)
+        
+        # Suggest alternatives based on available test results
+        alternatives = self._generate_alternative_suggestions()
+        
+        # Provide specific recommendations
+        recommendation = self._generate_specific_recommendations(missing_components)
+        
+        content = {
+            "status": "데이터 준비 중",
+            "missing_components": missing_components,
+            "explanation": explanation,
+            "alternatives": alternatives,
+            "recommendation": recommendation,
+            "data_availability": self._assess_data_availability(available_data),
+            "next_steps": self._suggest_next_steps(missing_components)
+        }
+        
+        return TransformedDocument(
+            doc_type="PREFERENCE_ANALYSIS",
+            content=content,
+            summary_text="선호도 분석: 데이터 준비 중 - 다른 분석 결과 이용 가능",
+            metadata={
+                "data_sources": [], 
+                "created_at": datetime.now().isoformat(), 
+                "sub_type": "unavailable",
+                "completion_level": "none",
+                "has_alternatives": True,
+                "missing_count": len(missing_components)
+            }
+        )
+
+    def _generate_missing_data_explanation(self, missing_components: List[str]) -> str:
+        """Generate detailed explanation for why preference data might be missing"""
+        if len(missing_components) == 3:
+            # All preference data is missing
+            explanation = "현재 이미지 선호도 분석과 관련된 모든 데이터를 이용할 수 없습니다.\n\n"
+            explanation += "이는 다음과 같은 이유일 수 있습니다:\n"
+            explanation += "• 이미지 선호도 검사를 아직 시작하지 않았거나 완료하지 않았습니다\n"
+            explanation += "• 검사는 완료했지만 결과 처리가 아직 진행 중입니다\n"
+            explanation += "• 검사 응답률이 낮아 신뢰할 수 있는 분석이 어렵습니다\n"
+            explanation += "• 일시적인 시스템 처리 지연이 발생했습니다\n"
+            explanation += "• 검사 데이터에 오류가 있어 재처리가 필요합니다"
+        elif len(missing_components) == 2:
+            # Partial data missing
+            explanation = f"현재 다음 선호도 분석 데이터를 이용할 수 없습니다:\n"
+            explanation += "\n".join([f"• {component}" for component in missing_components])
+            explanation += "\n\n이는 검사가 부분적으로만 완료되었거나, 일부 데이터 처리가 지연되고 있을 수 있습니다."
+        else:
+            # Single component missing
+            component = missing_components[0]
+            explanation = f"현재 {component} 데이터를 이용할 수 없습니다.\n\n"
+            if "통계" in component:
+                explanation += "검사 통계 정보는 처리 중이지만, 다른 선호도 분석 결과는 확인하실 수 있습니다."
+            elif "분석 결과" in component:
+                explanation += "선호도 분석은 처리 중이지만, 검사 통계와 직업 추천은 확인하실 수 있습니다."
+            else:
+                explanation += "직업 추천은 처리 중이지만, 다른 선호도 분석 결과는 확인하실 수 있습니다."
+        
+        return explanation
+
+    def _generate_alternative_suggestions(self) -> str:
+        """Generate suggestions for alternative test results to explore"""
+        alternatives = "\n대신 다음 분석 결과를 확인하실 수 있습니다:\n\n"
+        alternatives += "🔍 **성향 분석**\n"
+        alternatives += "   • 개인의 성격 유형과 행동 패턴 분석\n"
+        alternatives += "   • 주요 성향과 특성에 대한 상세한 설명\n"
+        alternatives += "   • 성향 기반 강점과 개선 영역 파악\n\n"
+        
+        alternatives += "🧠 **사고력 분석**\n"
+        alternatives += "   • 다양한 인지 능력과 사고 스타일 평가\n"
+        alternatives += "   • 논리적, 창의적, 분석적 사고력 측정\n"
+        alternatives += "   • 개인별 사고 강점 영역 식별\n\n"
+        
+        alternatives += "💪 **역량 분석**\n"
+        alternatives += "   • 핵심 역량과 능력 평가\n"
+        alternatives += "   • 직무별 적합성과 잠재력 분석\n"
+        alternatives += "   • 개발 가능한 역량 영역 제시\n\n"
+        
+        alternatives += "💼 **직업 추천**\n"
+        alternatives += "   • 성향과 역량 기반 직업 추천\n"
+        alternatives += "   • 적합한 직무와 업무 환경 제안\n"
+        alternatives += "   • 관련 전공과 학습 방향 안내\n\n"
+        
+        alternatives += "📚 **학습 스타일**\n"
+        alternatives += "   • 개인에게 맞는 학습 방법 제안\n"
+        alternatives += "   • 효과적인 공부 전략과 환경 추천\n"
+        alternatives += "   • 추천 학습 과목과 분야 안내"
+        
+        return alternatives
+
+    def _generate_specific_recommendations(self, missing_components: List[str]) -> str:
+        """Generate specific recommendations based on what's missing"""
+        if len(missing_components) == 3:
+            return ("이미지 선호도 검사를 완료하지 않으셨다면 먼저 검사를 진행해보세요. "
+                   "검사를 완료하셨다면 잠시 후 다시 확인해보시거나, "
+                   "다른 분석 결과를 먼저 살펴보시는 것을 추천합니다.")
+        elif len(missing_components) == 2:
+            return ("일부 선호도 데이터는 처리 중입니다. "
+                   "이용 가능한 다른 분석 결과를 먼저 확인해보시고, "
+                   "선호도 분석은 잠시 후 다시 시도해보세요.")
+        else:
+            return ("대부분의 선호도 분석 결과는 이용 가능합니다. "
+                   "현재 이용 가능한 결과를 먼저 확인해보시고, "
+                   "누락된 부분은 잠시 후 다시 확인해보세요.")
+
+    def _assess_data_availability(self, available_data: Dict[str, bool]) -> Dict[str, str]:
+        """Assess and describe the availability of each data component"""
+        availability = {}
+        
+        if available_data["stats"]:
+            availability["검사_통계"] = "이용 가능"
+        else:
+            availability["검사_통계"] = "처리 중"
+            
+        if available_data["preferences"]:
+            availability["선호도_분석"] = "이용 가능"
+        else:
+            availability["선호도_분석"] = "처리 중"
+            
+        if available_data["jobs"]:
+            availability["직업_추천"] = "이용 가능"
+        else:
+            availability["직업_추천"] = "처리 중"
+            
+        return availability
+
+    def _suggest_next_steps(self, missing_components: List[str]) -> List[str]:
+        """Suggest specific next steps based on missing data"""
+        steps = []
+        
+        if len(missing_components) == 3:
+            steps.extend([
+                "이미지 선호도 검사 완료 여부를 확인해보세요",
+                "성향 분석 결과부터 확인해보세요",
+                "사고력 분석으로 인지 능력을 파악해보세요",
+                "역량 분석으로 강점 영역을 확인해보세요",
+                "30분 후 선호도 분석을 다시 시도해보세요"
+            ])
+        elif "이미지 선호도 검사 통계" in missing_components:
+            steps.extend([
+                "이용 가능한 선호도 분석 결과를 먼저 확인해보세요",
+                "검사 통계는 잠시 후 다시 확인해보세요"
+            ])
+        elif "선호도 분석 결과" in missing_components:
+            steps.extend([
+                "검사 통계를 통해 검사 완료 상태를 확인해보세요",
+                "선호도 기반 직업 추천을 먼저 살펴보세요"
+            ])
+        else:
+            steps.extend([
+                "현재 이용 가능한 선호도 분석을 확인해보세요",
+                "성향 기반 직업 추천과 비교해보세요"
+            ])
+            
+        return steps
+
+    def _create_partial_preference_document(self, available_data: Dict[str, bool], partial_content: Dict[str, Any]) -> TransformedDocument:
+        """Create document for scenarios with partial preference data"""
+        
+        available_components = []
+        missing_components = []
+        
+        if available_data["stats"]:
+            available_components.append("이미지 선호도 검사 통계")
+        else:
+            missing_components.append("이미지 선호도 검사 통계")
+            
+        if available_data["preferences"]:
+            available_components.append("선호도 분석 결과")
+        else:
+            missing_components.append("선호도 분석 결과")
+            
+        if available_data["jobs"]:
+            available_components.append("선호도 기반 직업 추천")
+        else:
+            missing_components.append("선호도 기반 직업 추천")
+        
+        # Create informative content about partial availability
+        explanation = f"선호도 분석이 부분적으로 완료되었습니다.\n\n"
+        explanation += f"**이용 가능한 데이터:**\n"
+        explanation += "\n".join([f"✅ {comp}" for comp in available_components])
+        explanation += f"\n\n**처리 중인 데이터:**\n"
+        explanation += "\n".join([f"⏳ {comp}" for comp in missing_components])
+        
+        explanation += "\n\n현재 이용 가능한 데이터로도 의미 있는 선호도 분석을 제공할 수 있습니다. "
+        explanation += "누락된 데이터는 처리가 완료되는 대로 추가될 예정입니다."
+        
+        content = {
+            "status": "부분 완료",
+            "available_components": available_components,
+            "missing_components": missing_components,
+            "explanation": explanation,
+            "partial_data": partial_content,
+            "completion_percentage": (len(available_components) / 3) * 100,
+            "recommendation": "현재 이용 가능한 선호도 분석을 먼저 확인해보시고, 추가 데이터는 잠시 후 다시 확인해보세요."
+        }
+        
+        summary = f"선호도 분석: 부분 완료 ({len(available_components)}/3 항목 이용 가능)"
+        
+        return TransformedDocument(
+            doc_type="PREFERENCE_ANALYSIS",
+            content=content,
+            summary_text=summary,
+            metadata={
+                "data_sources": [], 
+                "created_at": datetime.now().isoformat(), 
+                "sub_type": "partial_available",
+                "completion_level": "partial",
+                "available_count": len(available_components),
+                "missing_count": len(missing_components)
+            }
+        )
     
     # ==================== MAIN TRANSFORMATION METHOD ====================
     async def transform_all_documents(

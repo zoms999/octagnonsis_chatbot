@@ -17,6 +17,7 @@ from api.etl_endpoints import router as etl_router
 from api.chat_endpoints import router as chat_router
 from api.user_endpoints import router as user_router
 from api.auth_endpoints import router as auth_router
+from api.admin_preference_endpoints import router as admin_preference_router
 from monitoring.metrics import get_metrics
 from database.connection import init_database
 from etl.logging_config import setup_logging
@@ -66,6 +67,7 @@ app.include_router(auth_router)
 app.include_router(etl_router)
 app.include_router(chat_router)
 app.include_router(user_router)
+app.include_router(admin_preference_router)
 
 # Global exception handler
 @app.exception_handler(Exception)

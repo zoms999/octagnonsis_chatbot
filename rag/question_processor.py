@@ -102,7 +102,12 @@ class QuestionProcessor:
             ],
             QuestionCategory.PREFERENCE_ANALYSIS: [
                 "선호", "취향", "preference", "like", "interest", "favor",
-                "이미지", "image", "picture", "visual"
+                "이미지", "image", "picture", "visual", "선호도", "좋아하는",
+                "관심", "흥미", "매력", "끌리는", "선택", "취미", "활동",
+                "스타일", "패턴", "경향", "성향", "기호", "선호분석",
+                "이미지선호", "선호검사", "선호결과", "선호도분석", "좋아",
+                "어떤것", "무엇을", "뭘", "뭐를", "어떤활동", "어떤일",
+                "취향분석"  # Specific combination
             ],
             QuestionCategory.GENERAL_COMPARISON: [
                 "비교", "compare", "comparison", "versus", "차이", "difference",
@@ -286,7 +291,14 @@ class QuestionProcessor:
             for keyword in keywords:
                 if keyword.lower() in question_lower:
                     # Weight longer keywords more heavily
-                    score += len(keyword) / 10
+                    keyword_weight = len(keyword) / 10
+                    
+                    # Give extra weight to preference-specific keywords
+                    if category == QuestionCategory.PREFERENCE_ANALYSIS:
+                        if keyword in ["선호", "선호도", "취향", "좋아하는", "preference"]:
+                            keyword_weight *= 2.0  # Double weight for core preference terms
+                    
+                    score += keyword_weight
             category_scores[category] = score
         
         # Find the category with highest score

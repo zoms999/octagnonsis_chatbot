@@ -1,20 +1,36 @@
 """
 Legacy Query Integration Wrapper
 Wraps existing AptitudeTestQueries class with async interface and error handling
+Enhanced with comprehensive logging and diagnostics for preference queries
+Optimized with connection pooling, caching, and performance monitoring
 """
 
 import asyncio
 import logging
+import time
 from typing import Dict, Any, List, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, DisconnectionError, OperationalError, TimeoutError as SQLTimeoutError
+import structlog
+import random
 
+# Import monitoring components
+from monitoring.preference_metrics import (
+    get_preference_metrics_collector,
+    PreferenceQueryType
+)
+
+# Import optimization components
+from etl.preference_query_optimizer import get_preference_query_optimizer
+
+# Setup structured logging for preference query diagnostics
 logger = logging.getLogger(__name__)
+preference_logger = structlog.get_logger("preference_queries")
 
 @dataclass
 class QueryResult:
@@ -25,6 +41,32 @@ class QueryResult:
     error: Optional[str] = None
     execution_time: Optional[float] = None
     row_count: Optional[int] = None
+
+@dataclass
+class PreferenceQueryDiagnostics:
+    """Diagnostic information for preference queries"""
+    anp_seq: int
+    query_name: str
+    execution_time: float
+    success: bool
+    row_count: int
+    error_details: Optional[str] = None
+    data_quality_score: Optional[float] = None
+    validation_issues: List[str] = field(default_factory=list)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class PreferenceDataReport:
+    """Comprehensive report for preference data analysis"""
+    anp_seq: int
+    total_queries: int
+    successful_queries: int
+    failed_queries: int
+    total_execution_time: float
+    data_availability: Dict[str, bool]
+    diagnostics: List[PreferenceQueryDiagnostics]
+    recommendations: List[str] = field(default_factory=list)
+    timestamp: datetime = field(default_factory=datetime.now)
 
 class QueryExecutionError(Exception):
     """Raised when query execution fails"""
@@ -40,6 +82,55 @@ class QueryValidationError(Exception):
         self.validation_error = validation_error
         super().__init__(f"Query '{query_name}' validation failed: {validation_error}")
 
+class PreferenceQueryConnectionError(Exception):
+    """Raised when preference query database connection fails"""
+    def __init__(self, query_name: str, original_error: Exception):
+        self.query_name = query_name
+        self.original_error = original_error
+        super().__init__(f"Preference query '{query_name}' connection failed: {str(original_error)}")
+
+class PreferenceQueryTimeoutError(Exception):
+    """Raised when preference query times out"""
+    def __init__(self, query_name: str, timeout_seconds: float):
+        self.query_name = query_name
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"Preference query '{query_name}' timed out after {timeout_seconds}s")
+
+class PreferenceDataQualityError(Exception):
+    """Raised when preference data quality is below acceptable threshold"""
+    def __init__(self, query_name: str, quality_score: float, threshold: float):
+        self.query_name = query_name
+        self.quality_score = quality_score
+        self.threshold = threshold
+        super().__init__(f"Preference query '{query_name}' data quality {quality_score:.2f} below threshold {threshold:.2f}")
+
+@dataclass
+class ValidationResult:
+    """Result of data validation with detailed error reporting"""
+    is_valid: bool
+    error_count: int = 0
+    warning_count: int = 0
+    issues: List[str] = field(default_factory=list)
+    data_quality_score: float = 0.0
+    empty_vs_invalid: str = "unknown"  # "empty", "invalid", "valid"
+
+@dataclass
+class PreferenceQueryMetrics:
+    """Metrics for preference query performance and reliability"""
+    query_name: str
+    total_executions: int = 0
+    successful_executions: int = 0
+    failed_executions: int = 0
+    avg_execution_time: float = 0.0
+    max_execution_time: float = 0.0
+    min_execution_time: float = float('inf')
+    connection_errors: int = 0
+    timeout_errors: int = 0
+    validation_errors: int = 0
+    data_quality_scores: List[float] = field(default_factory=list)
+    last_success_time: Optional[datetime] = None
+    last_failure_time: Optional[datetime] = None
+
 class AptitudeTestQueries:
     """
     실제 레거시 DB의 mwd_* 테이블을 조회하여 결과를 반환하는 구현.
@@ -54,6 +145,506 @@ class AptitudeTestQueries:
     def _run(self, sql: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         rows = self._sync_sess.execute(text(sql), params).mappings().all()
         return [dict(r) for r in rows]
+    
+    async def _execute_preference_query_optimized(
+        self, 
+        anp_seq: int, 
+        query_name: str, 
+        sql: str, 
+        max_retries: int = 3,
+        expected_row_count: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Execute preference query with optimization features (async version)
+        Uses the preference query optimizer if available, falls back to legacy method
+        """
+        # Try to use the optimized query executor first
+        optimizer = get_preference_query_optimizer()
+        if optimizer:
+            try:
+                preference_logger.info(
+                    "Using optimized preference query execution",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    timestamp=datetime.now().isoformat()
+                )
+                
+                result = await optimizer.execute_preference_query(
+                    query_name=query_name,
+                    anp_seq=anp_seq,
+                    sql=sql,
+                    max_retries=max_retries
+                )
+                
+                # Validate result using existing validation logic
+                validation_result = self._validate_preference_query_result(
+                    query_name, result, expected_row_count
+                )
+                
+                if not validation_result.is_valid and validation_result.error_count > 0:
+                    raise PreferenceDataQualityError(
+                        query_name, 
+                        validation_result.data_quality_score, 
+                        0.3  # Minimum acceptable quality threshold
+                    )
+                
+                preference_logger.info(
+                    "Optimized preference query completed successfully",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    row_count=len(result),
+                    validation_passed=validation_result.is_valid,
+                    timestamp=datetime.now().isoformat()
+                )
+                
+                return result
+                
+            except Exception as e:
+                preference_logger.warning(
+                    "Optimized preference query failed, falling back to legacy method",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    error=str(e),
+                    timestamp=datetime.now().isoformat()
+                )
+                # Fall through to legacy method
+        
+        # Fall back to legacy synchronous method
+        return self._execute_preference_query_with_retry(
+            anp_seq, query_name, sql, max_retries, expected_row_count
+        )
+
+    def _execute_preference_query_with_retry(
+        self, 
+        anp_seq: int, 
+        query_name: str, 
+        sql: str, 
+        max_retries: int = 3,
+        expected_row_count: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Execute preference query with enhanced error handling and retry logic (legacy sync version)
+        """
+        start_time = time.time()
+        last_exception = None
+        
+        # Get metrics collector for monitoring
+        metrics_collector = get_preference_metrics_collector()
+        
+        # Map query names to enum types
+        query_type_map = {
+            "imagePreferenceStatsQuery": PreferenceQueryType.IMAGE_PREFERENCE_STATS,
+            "preferenceDataQuery": PreferenceQueryType.PREFERENCE_DATA,
+            "preferenceJobsQuery": PreferenceQueryType.PREFERENCE_JOBS
+        }
+        
+        query_type = query_type_map.get(query_name)
+        
+        preference_logger.info(
+            "Starting legacy preference query execution with retry",
+            anp_seq=anp_seq,
+            query_name=query_name,
+            max_retries=max_retries,
+            expected_row_count=expected_row_count,
+            timestamp=datetime.now().isoformat()
+        )
+        
+        for attempt in range(max_retries + 1):
+            attempt_start = time.time()
+            
+            try:
+                # Validate anp_seq parameter
+                if not isinstance(anp_seq, int) or anp_seq <= 0:
+                    raise ValueError(f"Invalid anp_seq parameter: {anp_seq}")
+                
+                preference_logger.debug(
+                    "Executing legacy preference query attempt",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    attempt=attempt + 1,
+                    timestamp=datetime.now().isoformat()
+                )
+                
+                # Execute the query
+                result = self._run(sql, {"anp_seq": anp_seq})
+                attempt_time = time.time() - attempt_start
+                total_time = time.time() - start_time
+                row_count = len(result) if result else 0
+                
+                # Validate result
+                validation_result = self._validate_preference_query_result(
+                    query_name, result, expected_row_count
+                )
+                
+                # Calculate data quality score
+                data_quality_score = self._calculate_data_quality_score(query_name, result)
+                
+                # Log detailed success information
+                preference_logger.info(
+                    "Legacy preference query completed successfully",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    attempt=attempt + 1,
+                    attempt_time=attempt_time,
+                    total_time=total_time,
+                    row_count=row_count,
+                    has_data=row_count > 0,
+                    data_quality_score=data_quality_score,
+                    validation_passed=validation_result.is_valid,
+                    validation_issues=validation_result.issues,
+                    empty_vs_invalid=validation_result.empty_vs_invalid,
+                    timestamp=datetime.now().isoformat()
+                )
+                
+                # Check if validation passed
+                if not validation_result.is_valid and validation_result.error_count > 0:
+                    raise PreferenceDataQualityError(
+                        query_name, 
+                        data_quality_score, 
+                        0.3  # Minimum acceptable quality threshold
+                    )
+                
+                # Record successful execution metrics
+                if query_type:
+                    execution_time_ms = (time.time() - start_time) * 1000
+                    asyncio.create_task(metrics_collector.record_query_execution(
+                        query_type=query_type,
+                        anp_seq=anp_seq,
+                        execution_time_ms=execution_time_ms,
+                        success=True,
+                        row_count=len(result)
+                    ))
+                
+                return result
+                
+            except (DisconnectionError, OperationalError, SQLTimeoutError) as e:
+                # Database connection/operational errors - retry with exponential backoff
+                attempt_time = time.time() - attempt_start
+                last_exception = PreferenceQueryConnectionError(query_name, e)
+                
+                preference_logger.warning(
+                    "Legacy preference query connection error",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    attempt=attempt + 1,
+                    attempt_time=attempt_time,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    will_retry=attempt < max_retries,
+                    timestamp=datetime.now().isoformat()
+                )
+                
+                if attempt < max_retries:
+                    # Exponential backoff with jitter
+                    base_delay = 1.0 * (2 ** attempt)
+                    jitter = random.uniform(0.1, 0.5)
+                    delay = base_delay + jitter
+                    
+                    preference_logger.info(
+                        "Retrying legacy preference query after connection error",
+                        anp_seq=anp_seq,
+                        query_name=query_name,
+                        retry_delay=delay,
+                        next_attempt=attempt + 2,
+                        timestamp=datetime.now().isoformat()
+                    )
+                    
+                    time.sleep(delay)
+                    continue
+                else:
+                    break
+                    
+            except (ValueError, PreferenceDataQualityError) as e:
+                # Data validation errors - don't retry, log and re-raise
+                attempt_time = time.time() - attempt_start
+                total_time = time.time() - start_time
+                
+                preference_logger.error(
+                    "Legacy preference query validation error",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    attempt=attempt + 1,
+                    attempt_time=attempt_time,
+                    total_time=total_time,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    timestamp=datetime.now().isoformat()
+                )
+                
+                raise
+                
+            except Exception as e:
+                # Other unexpected errors - retry with shorter delay
+                attempt_time = time.time() - attempt_start
+                last_exception = e
+                
+                preference_logger.error(
+                    "Legacy preference query unexpected error",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    attempt=attempt + 1,
+                    attempt_time=attempt_time,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    traceback=traceback.format_exc(),
+                    will_retry=attempt < max_retries,
+                    timestamp=datetime.now().isoformat()
+                )
+                
+                if attempt < max_retries:
+                    # Shorter delay for unexpected errors
+                    delay = 0.5 * (attempt + 1)
+                    
+                    preference_logger.info(
+                        "Retrying legacy preference query after unexpected error",
+                        anp_seq=anp_seq,
+                        query_name=query_name,
+                        retry_delay=delay,
+                        next_attempt=attempt + 2,
+                        timestamp=datetime.now().isoformat()
+                    )
+                    
+                    time.sleep(delay)
+                    continue
+                else:
+                    break
+        
+        # All retries exhausted
+        total_time = time.time() - start_time
+        
+        preference_logger.error(
+            "Legacy preference query failed after all retries",
+            anp_seq=anp_seq,
+            query_name=query_name,
+            total_attempts=max_retries + 1,
+            total_time=total_time,
+            final_error=str(last_exception) if last_exception else "Unknown error",
+            timestamp=datetime.now().isoformat()
+        )
+        
+        # Record failed execution metrics
+        if query_type:
+            execution_time_ms = total_time * 1000
+            error_message = str(last_exception) if last_exception else "Unknown error after all retries"
+            asyncio.create_task(metrics_collector.record_query_execution(
+                query_type=query_type,
+                anp_seq=anp_seq,
+                execution_time_ms=execution_time_ms,
+                success=False,
+                row_count=0,
+                error_message=error_message
+            ))
+        
+        # Re-raise the last exception or create a generic one
+        if last_exception:
+            raise last_exception
+        else:
+            raise QueryExecutionError(query_name, Exception("Unknown error after all retries"))
+    
+    def _validate_preference_query_result(
+        self, 
+        query_name: str, 
+        result: List[Dict[str, Any]], 
+        expected_row_count: Optional[int] = None
+    ) -> ValidationResult:
+        """
+        Enhanced validation for preference query results with detailed error reporting
+        """
+        validation_result = ValidationResult(is_valid=True)
+        
+        # Check if result is None
+        if result is None:
+            validation_result.is_valid = False
+            validation_result.error_count += 1
+            validation_result.issues.append("Query result is None")
+            validation_result.empty_vs_invalid = "invalid"
+            return validation_result
+        
+        # Check if result is empty
+        if len(result) == 0:
+            validation_result.empty_vs_invalid = "empty"
+            
+            # For some queries, empty results might be valid
+            if query_name in ["preferenceDataQuery", "preferenceJobsQuery"]:
+                validation_result.warning_count += 1
+                validation_result.issues.append("No preference data found - may indicate missing test results")
+            else:
+                validation_result.issues.append("Empty result set")
+            
+            return validation_result
+        
+        validation_result.empty_vs_invalid = "valid"
+        
+        # Check expected row count
+        if expected_row_count is not None:
+            if len(result) < expected_row_count * 0.5:  # Allow 50% tolerance
+                validation_result.warning_count += 1
+                validation_result.issues.append(
+                    f"Row count {len(result)} significantly below expected {expected_row_count}"
+                )
+            elif len(result) > expected_row_count * 2:  # Allow 200% tolerance
+                validation_result.warning_count += 1
+                validation_result.issues.append(
+                    f"Row count {len(result)} significantly above expected {expected_row_count}"
+                )
+        
+        # Query-specific validation
+        if query_name == "imagePreferenceStatsQuery":
+            validation_result = self._validate_image_preference_stats_detailed(result, validation_result)
+        elif query_name == "preferenceDataQuery":
+            validation_result = self._validate_preference_data_detailed(result, validation_result)
+        elif query_name == "preferenceJobsQuery":
+            validation_result = self._validate_preference_jobs_detailed(result, validation_result)
+        
+        # Calculate overall data quality score
+        validation_result.data_quality_score = self._calculate_data_quality_score(query_name, result)
+        
+        return validation_result
+    
+    def _validate_image_preference_stats_detailed(
+        self, 
+        result: List[Dict[str, Any]], 
+        validation_result: ValidationResult
+    ) -> ValidationResult:
+        """Detailed validation for image preference stats query"""
+        if len(result) != 1:
+            validation_result.is_valid = False
+            validation_result.error_count += 1
+            validation_result.issues.append(f"Expected exactly 1 row, got {len(result)}")
+            return validation_result
+        
+        row = result[0]
+        required_fields = ["total_image_count", "response_count", "response_rate"]
+        
+        for field in required_fields:
+            if field not in row:
+                validation_result.is_valid = False
+                validation_result.error_count += 1
+                validation_result.issues.append(f"Missing required field: {field}")
+            elif row[field] is None:
+                validation_result.warning_count += 1
+                validation_result.issues.append(f"Null value in field: {field}")
+        
+        # Validate data ranges and relationships
+        total_count = row.get("total_image_count", 0)
+        response_count = row.get("response_count", 0)
+        response_rate = row.get("response_rate", 0)
+        
+        if total_count <= 0:
+            validation_result.warning_count += 1
+            validation_result.issues.append("Total image count is zero or negative")
+        
+        if response_count < 0:
+            validation_result.is_valid = False
+            validation_result.error_count += 1
+            validation_result.issues.append("Response count is negative")
+        
+        if response_count > total_count:
+            validation_result.is_valid = False
+            validation_result.error_count += 1
+            validation_result.issues.append("Response count exceeds total count")
+        
+        if not 0 <= response_rate <= 100:
+            validation_result.is_valid = False
+            validation_result.error_count += 1
+            validation_result.issues.append(f"Response rate {response_rate} outside valid range 0-100")
+        
+        if response_rate < 30:
+            validation_result.warning_count += 1
+            validation_result.issues.append(f"Low response rate: {response_rate}%")
+        
+        return validation_result
+    
+    def _validate_preference_data_detailed(
+        self, 
+        result: List[Dict[str, Any]], 
+        validation_result: ValidationResult
+    ) -> ValidationResult:
+        """Detailed validation for preference data query"""
+        required_fields = ["preference_name", "question_count", "response_rate", "rank", "description"]
+        
+        for i, row in enumerate(result):
+            for field in required_fields:
+                if field not in row:
+                    validation_result.is_valid = False
+                    validation_result.error_count += 1
+                    validation_result.issues.append(f"Row {i+1}: Missing required field {field}")
+                elif row[field] is None or (isinstance(row[field], str) and row[field].strip() == ""):
+                    validation_result.warning_count += 1
+                    validation_result.issues.append(f"Row {i+1}: Empty value in field {field}")
+            
+            # Validate data types and ranges
+            rank = row.get("rank")
+            if rank is not None and (not isinstance(rank, int) or rank < 1 or rank > 3):
+                validation_result.is_valid = False
+                validation_result.error_count += 1
+                validation_result.issues.append(f"Row {i+1}: Invalid rank {rank}, expected 1-3")
+            
+            response_rate = row.get("response_rate")
+            if response_rate is not None:
+                if not isinstance(response_rate, (int, float)) or not 0 <= response_rate <= 100:
+                    validation_result.is_valid = False
+                    validation_result.error_count += 1
+                    validation_result.issues.append(f"Row {i+1}: Invalid response rate {response_rate}")
+                elif response_rate < 30:
+                    validation_result.warning_count += 1
+                    validation_result.issues.append(f"Row {i+1}: Low response rate {response_rate}%")
+        
+        # Check for expected top 3 preferences
+        if len(result) < 3:
+            validation_result.warning_count += 1
+            validation_result.issues.append(f"Expected 3 top preferences, got {len(result)}")
+        
+        return validation_result
+    
+    def _validate_preference_jobs_detailed(
+        self, 
+        result: List[Dict[str, Any]], 
+        validation_result: ValidationResult
+    ) -> ValidationResult:
+        """Detailed validation for preference jobs query"""
+        required_fields = ["preference_name", "preference_type", "jo_name", "jo_outline", "jo_mainbusiness", "majors"]
+        expected_types = {"rimg1", "rimg2", "rimg3"}
+        found_types = set()
+        
+        for i, row in enumerate(result):
+            for field in required_fields:
+                if field not in row:
+                    validation_result.is_valid = False
+                    validation_result.error_count += 1
+                    validation_result.issues.append(f"Row {i+1}: Missing required field {field}")
+                elif row[field] is None or (isinstance(row[field], str) and row[field].strip() == ""):
+                    validation_result.warning_count += 1
+                    validation_result.issues.append(f"Row {i+1}: Empty value in field {field}")
+            
+            # Validate preference type
+            pref_type = row.get("preference_type")
+            if pref_type:
+                found_types.add(pref_type)
+                if pref_type not in expected_types:
+                    validation_result.is_valid = False
+                    validation_result.error_count += 1
+                    validation_result.issues.append(f"Row {i+1}: Invalid preference type {pref_type}")
+        
+        # Check for missing preference types
+        missing_types = expected_types - found_types
+        if missing_types:
+            validation_result.warning_count += 1
+            validation_result.issues.append(f"Missing preference types: {', '.join(missing_types)}")
+        
+        # Check job distribution per preference type
+        jobs_per_type = {}
+        for row in result:
+            pref_type = row.get("preference_type")
+            if pref_type:
+                jobs_per_type[pref_type] = jobs_per_type.get(pref_type, 0) + 1
+        
+        for pref_type, job_count in jobs_per_type.items():
+            if job_count < 3:
+                validation_result.warning_count += 1
+                validation_result.issues.append(f"Low job count for {pref_type}: {job_count}")
+        
+        return validation_result
 
     def _query_tendency(self, anp_seq: int) -> List[Dict[str, Any]]:
         # [수정] 3순위 성향(rv_tnd3)까지 조회하도록 쿼리 확장
@@ -346,61 +937,76 @@ class AptitudeTestQueries:
         return self._run(sql, {"anp_seq": anp_seq})
 
     # ▼▼▼ [4단계: 추가된 메소드 1] ▼▼▼
-    def _query_image_preference_stats(self, anp_seq: int) -> List[Dict[str, Any]]:
-        # 원본 #19 쿼리(imagePreferenceQuery) 기반
-        sql = """
-        SELECT
-          rv.rv_imgtcnt AS total_image_count,
-          rv.rv_imgrcnt AS response_count,
-          (rv.rv_imgresrate * 100)::int AS response_rate
-        FROM mwd_resval rv
-        WHERE rv.anp_seq = :anp_seq
-        """
-        return self._run(sql, {"anp_seq": anp_seq})
+    async def _query_image_preference_stats(self, anp_seq: int) -> List[Dict[str, Any]]:
+        # 원본 #19 쿼리(imagePreferenceQuery) 기반 - 최적화된 버전 사용
+        return await self._execute_preference_query_optimized(
+            anp_seq=anp_seq,
+            query_name="imagePreferenceStatsQuery",
+            sql="""
+            SELECT
+              rv.rv_imgtcnt AS total_image_count,
+              rv.rv_imgrcnt AS response_count,
+              (rv.rv_imgresrate * 100)::int AS response_rate
+            FROM mwd_resval rv
+            WHERE rv.anp_seq = :anp_seq
+            """,
+            max_retries=3,
+            expected_row_count=1
+        )
 
     # ▼▼▼ [4단계: 추가된 메소드 2] ▼▼▼
-    def _query_preference_data(self, anp_seq: int) -> List[Dict[str, Any]]:
-        # 원본 #23 쿼리(preferenceDataQuery) 기반
-        sql = """
-        SELECT
-            qa.qua_name as preference_name,
-            sc1.sc1_qcnt as question_count,
-            (round(sc1.sc1_resrate * 100))::int AS response_rate,
-            sc1.sc1_rank as rank,
-            qe.que_explain as description
-        FROM mwd_score1 sc1
-        JOIN mwd_question_attr qa ON qa.qua_code = sc1.qua_code
-        JOIN mwd_question_explain qe ON qe.qua_code = qa.qua_code AND qe.que_switch = 1
-        WHERE sc1.anp_seq = :anp_seq
-          AND sc1.sc1_step = 'img'
-          AND sc1.sc1_rank <= 3
-        ORDER BY sc1.sc1_rank
-        """
-        return self._run(sql, {"anp_seq": anp_seq})
+    async def _query_preference_data(self, anp_seq: int) -> List[Dict[str, Any]]:
+        # 원본 #23 쿼리(preferenceDataQuery) 기반 - 최적화된 버전 사용
+        return await self._execute_preference_query_optimized(
+            anp_seq=anp_seq,
+            query_name="preferenceDataQuery",
+            sql="""
+            SELECT
+                qa.qua_name as preference_name,
+                sc1.sc1_qcnt as question_count,
+                (round(sc1.sc1_resrate * 100))::int AS response_rate,
+                sc1.sc1_rank as rank,
+                qe.que_explain as description
+            FROM mwd_score1 sc1
+            JOIN mwd_question_attr qa ON qa.qua_code = sc1.qua_code
+            JOIN mwd_question_explain qe ON qe.qua_code = qa.qua_code AND qe.que_switch = 1
+            WHERE sc1.anp_seq = :anp_seq
+              AND sc1.sc1_step = 'img'
+              AND sc1.sc1_rank <= 3
+            ORDER BY sc1.sc1_rank
+            """,
+            max_retries=3,
+            expected_row_count=3
+        )
 
     # ▼▼▼ [4단계: 추가된 메소드 3] ▼▼▼
-    def _query_preference_jobs(self, anp_seq: int) -> List[Dict[str, Any]]:
-        # 원본 #24, 25, 26 쿼리를 하나로 통합
-        sql = """
-        SELECT
-          qa.qua_name as preference_name,
-          rj.rej_kind as preference_type, -- rimg1, rimg2, rimg3
-          jo.jo_name,
-          jo.jo_outline,
-          jo.jo_mainbusiness,
-          string_agg(ma.ma_name, ', ' ORDER BY ma.ma_name) AS majors
-        FROM mwd_resjob rj
-        JOIN mwd_job jo ON jo.jo_code = rj.rej_code
-        JOIN mwd_job_major_map jmm ON jmm.jo_code = jo.jo_code
-        JOIN mwd_major ma ON ma.ma_code = jmm.ma_code
-        LEFT OUTER JOIN mwd_question_attr qa ON qa.qua_code = rj.rej_quacode
-        WHERE rj.anp_seq = :anp_seq
-          AND rj.rej_kind IN ('rimg1', 'rimg2', 'rimg3')
-          AND rj.rej_rank <= 5
-        GROUP BY rj.rej_kind, qa.qua_name, jo.jo_code, rj.rej_rank
-        ORDER BY rj.rej_kind, rj.rej_rank
-        """
-        return self._run(sql, {"anp_seq": anp_seq})
+    async def _query_preference_jobs(self, anp_seq: int) -> List[Dict[str, Any]]:
+        # 원본 #24, 25, 26 쿼리를 하나로 통합 - 최적화된 버전 사용
+        return await self._execute_preference_query_optimized(
+            anp_seq=anp_seq,
+            query_name="preferenceJobsQuery",
+            sql="""
+            SELECT
+              qa.qua_name as preference_name,
+              rj.rej_kind as preference_type, -- rimg1, rimg2, rimg3
+              jo.jo_name,
+              jo.jo_outline,
+              jo.jo_mainbusiness,
+              string_agg(ma.ma_name, ', ' ORDER BY ma.ma_name) AS majors
+            FROM mwd_resjob rj
+            JOIN mwd_job jo ON jo.jo_code = rj.rej_code
+            JOIN mwd_job_major_map jmm ON jmm.jo_code = jo.jo_code
+            JOIN mwd_major ma ON ma.ma_code = jmm.ma_code
+            LEFT OUTER JOIN mwd_question_attr qa ON qa.qua_code = rj.rej_quacode
+            WHERE rj.anp_seq = :anp_seq
+              AND rj.rej_kind IN ('rimg1', 'rimg2', 'rimg3')
+              AND rj.rej_rank <= 5
+            GROUP BY rj.rej_kind, qa.qua_name, jo.jo_code, rj.rej_rank
+            ORDER BY rj.rej_kind, rj.rej_rank
+            """,
+            max_retries=3,
+            expected_row_count=15  # 3 preference types * 5 jobs each
+        )
 
     # ▼▼▼ [5단계: 추가된 메소드 1] ▼▼▼
     def _query_tendency_stats(self, anp_seq: int) -> List[Dict[str, Any]]:
@@ -503,7 +1109,7 @@ class AptitudeTestQueries:
             pe.pe_school_major as major,
             coalesce(jc.jname, '') as job_status,
             pe.pe_job_name as company_name,
-            pe.pe_job_detail as job_title,
+            pe.pe_job_detail as job_title, pe.pe_email,
             ins.ins_name as institute_name
         FROM mwd_answer_progress ap
         JOIN mwd_account ac ON ap.ac_gid = ac.ac_gid
@@ -698,6 +1304,267 @@ class AptitudeTestQueries:
         WHERE anp.anp_seq = :anp_seq
         """
         return self._run(sql, {"anp_seq": anp_seq})
+
+    def diagnose_preference_queries(self, anp_seq: int) -> PreferenceDataReport:
+        """
+        Comprehensive diagnostic method for preference queries
+        Tests all preference queries and provides detailed analysis
+        """
+        preference_logger.info(
+            "Starting comprehensive preference query diagnostics",
+            anp_seq=anp_seq,
+            timestamp=datetime.now().isoformat()
+        )
+        
+        start_time = time.time()
+        diagnostics = []
+        successful_queries = 0
+        failed_queries = 0
+        data_availability = {}
+        
+        # Test each preference query individually
+        preference_queries = [
+            ("imagePreferenceStatsQuery", self._query_image_preference_stats),
+            ("preferenceDataQuery", self._query_preference_data),
+            ("preferenceJobsQuery", self._query_preference_jobs)
+        ]
+        
+        for query_name, query_method in preference_queries:
+            query_start = time.time()
+            
+            try:
+                result = query_method(anp_seq)
+                query_time = time.time() - query_start
+                row_count = len(result) if result else 0
+                
+                # Calculate data quality score
+                data_quality_score = self._calculate_data_quality_score(query_name, result)
+                
+                # Identify validation issues
+                validation_issues = self._identify_validation_issues(query_name, result)
+                
+                diagnostic = PreferenceQueryDiagnostics(
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    execution_time=query_time,
+                    success=True,
+                    row_count=row_count,
+                    data_quality_score=data_quality_score,
+                    validation_issues=validation_issues
+                )
+                
+                diagnostics.append(diagnostic)
+                successful_queries += 1
+                data_availability[query_name] = row_count > 0
+                
+                preference_logger.info(
+                    "Diagnostic query completed",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    success=True,
+                    execution_time=query_time,
+                    row_count=row_count,
+                    data_quality_score=data_quality_score,
+                    validation_issues=validation_issues
+                )
+                
+            except Exception as e:
+                query_time = time.time() - query_start
+                error_details = f"{type(e).__name__}: {str(e)}"
+                
+                diagnostic = PreferenceQueryDiagnostics(
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    execution_time=query_time,
+                    success=False,
+                    row_count=0,
+                    error_details=error_details
+                )
+                
+                diagnostics.append(diagnostic)
+                failed_queries += 1
+                data_availability[query_name] = False
+                
+                preference_logger.error(
+                    "Diagnostic query failed",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    success=False,
+                    execution_time=query_time,
+                    error_details=error_details
+                )
+        
+        total_time = time.time() - start_time
+        
+        # Generate recommendations based on diagnostic results
+        recommendations = self._generate_preference_recommendations(diagnostics, data_availability)
+        
+        report = PreferenceDataReport(
+            anp_seq=anp_seq,
+            total_queries=len(preference_queries),
+            successful_queries=successful_queries,
+            failed_queries=failed_queries,
+            total_execution_time=total_time,
+            data_availability=data_availability,
+            diagnostics=diagnostics,
+            recommendations=recommendations
+        )
+        
+        preference_logger.info(
+            "Preference diagnostics completed",
+            anp_seq=anp_seq,
+            total_queries=len(preference_queries),
+            successful_queries=successful_queries,
+            failed_queries=failed_queries,
+            total_execution_time=total_time,
+            data_availability=data_availability,
+            recommendations=recommendations
+        )
+        
+        return report
+    
+    def _calculate_data_quality_score(self, query_name: str, result: List[Dict[str, Any]]) -> float:
+        """Calculate data quality score for a preference query result"""
+        if not result:
+            return 0.0
+        
+        score = 0.0
+        
+        if query_name == "imagePreferenceStatsQuery":
+            if len(result) == 1:
+                row = result[0]
+                total_count = row.get("total_image_count", 0)
+                response_count = row.get("response_count", 0)
+                response_rate = row.get("response_rate", 0)
+                
+                # Score based on data completeness and response rate
+                if total_count > 0:
+                    score += 0.4
+                if response_count > 0 and response_count <= total_count:
+                    score += 0.3
+                if 50 <= response_rate <= 100:
+                    score += 0.3
+                elif 30 <= response_rate < 50:
+                    score += 0.1  # Partial credit for low but valid rates
+                    
+        elif query_name == "preferenceDataQuery":
+            # Score based on number of preferences and response rates
+            if len(result) >= 3:
+                score += 0.5  # Has top 3 preferences
+            else:
+                score += 0.2 * len(result)  # Partial credit
+                
+            avg_response_rate = sum(row.get("response_rate", 0) for row in result) / len(result)
+            if avg_response_rate >= 70:
+                score += 0.5
+            elif avg_response_rate >= 50:
+                score += 0.3
+            elif avg_response_rate >= 30:
+                score += 0.1
+                
+        elif query_name == "preferenceJobsQuery":
+            # Score based on preference type coverage and job count
+            preference_types = set(row.get("preference_type") for row in result)
+            type_coverage = len(preference_types) / 3.0  # Expected 3 types
+            score += 0.6 * type_coverage
+            
+            if len(result) >= 10:  # Good job coverage
+                score += 0.4
+            elif len(result) >= 5:
+                score += 0.2
+        
+        return min(score, 1.0)  # Cap at 1.0
+    
+    def _identify_validation_issues(self, query_name: str, result: List[Dict[str, Any]]) -> List[str]:
+        """Identify potential validation issues with preference query results"""
+        issues = []
+        
+        if not result:
+            issues.append("No data returned")
+            return issues
+        
+        if query_name == "imagePreferenceStatsQuery":
+            if len(result) != 1:
+                issues.append(f"Expected 1 row, got {len(result)}")
+            else:
+                row = result[0]
+                total_count = row.get("total_image_count", 0)
+                response_count = row.get("response_count", 0)
+                response_rate = row.get("response_rate", 0)
+                
+                if total_count <= 0:
+                    issues.append("Total image count is zero or missing")
+                if response_count < 0:
+                    issues.append("Response count is negative")
+                elif response_count == 0:
+                    issues.append("Response count is zero")
+                if response_count > total_count:
+                    issues.append("Response count exceeds total count")
+                if not 0 <= response_rate <= 100:
+                    issues.append(f"Response rate {response_rate} outside valid range 0-100")
+                elif response_rate < 30:
+                    issues.append("Low response rate (< 30%)")
+                    
+        elif query_name == "preferenceDataQuery":
+            if len(result) < 3:
+                issues.append(f"Expected 3 preferences, got {len(result)}")
+            
+            for i, row in enumerate(result):
+                if not row.get("preference_name"):
+                    issues.append(f"Missing preference name in row {i+1}")
+                if row.get("response_rate", 0) < 30:
+                    issues.append(f"Low response rate in row {i+1}: {row.get('response_rate', 0)}%")
+                    
+        elif query_name == "preferenceJobsQuery":
+            preference_types = set(row.get("preference_type") for row in result)
+            expected_types = {"rimg1", "rimg2", "rimg3"}
+            missing_types = expected_types - preference_types
+            
+            if missing_types:
+                issues.append(f"Missing preference types: {', '.join(missing_types)}")
+            
+            for row in result:
+                if not row.get("jo_name"):
+                    issues.append("Missing job name in result")
+                if not row.get("preference_name"):
+                    issues.append("Missing preference name in result")
+        
+        return issues
+    
+    def _generate_preference_recommendations(self, diagnostics: List[PreferenceQueryDiagnostics], 
+                                           data_availability: Dict[str, bool]) -> List[str]:
+        """Generate recommendations based on diagnostic results"""
+        recommendations = []
+        
+        # Check for failed queries
+        failed_queries = [d.query_name for d in diagnostics if not d.success]
+        if failed_queries:
+            recommendations.append(f"Fix database connectivity issues for queries: {', '.join(failed_queries)}")
+        
+        # Check for missing data
+        missing_data_queries = [name for name, available in data_availability.items() if not available]
+        if missing_data_queries:
+            recommendations.append(f"Investigate missing preference data for: {', '.join(missing_data_queries)}")
+        
+        # Check for data quality issues
+        low_quality_queries = [d.query_name for d in diagnostics if d.data_quality_score and d.data_quality_score < 0.5]
+        if low_quality_queries:
+            recommendations.append(f"Improve data quality for queries: {', '.join(low_quality_queries)}")
+        
+        # Check for validation issues
+        queries_with_issues = [d.query_name for d in diagnostics if d.validation_issues]
+        if queries_with_issues:
+            recommendations.append(f"Address validation issues in queries: {', '.join(queries_with_issues)}")
+        
+        # Performance recommendations
+        slow_queries = [d.query_name for d in diagnostics if d.execution_time > 5.0]
+        if slow_queries:
+            recommendations.append(f"Optimize performance for slow queries: {', '.join(slow_queries)}")
+        
+        if not recommendations:
+            recommendations.append("All preference queries are functioning correctly")
+        
+        return recommendations
 
     def execute_all_queries(self, anp_seq: int) -> Dict[str, List[Dict[str, Any]]]:
         results: Dict[str, List[Dict[str, Any]]] = {}
@@ -1091,37 +1958,131 @@ class LegacyQueryExecutor:
 
     # ▼▼▼ [4단계: 추가된 유효성 검사 메소드] ▼▼▼
     def _validate_image_preference_stats_query(self, data: List[Dict[str, Any]]) -> bool:
-        """Validate image preference stats query results."""
-        if data is None: return False
-        if not data: return True
-        if len(data) != 1: return False
+        """Enhanced validation for image preference stats query results."""
+        if data is None: 
+            logger.warning("Image preference stats query returned None")
+            return False
+        if not data: 
+            logger.info("Image preference stats query returned empty result - may indicate missing data")
+            return True
+        if len(data) != 1: 
+            logger.error(f"Image preference stats query expected 1 row, got {len(data)}")
+            return False
         
         required_fields = ["total_image_count", "response_count", "response_rate"]
+        row = data[0]
+        
         for field in required_fields:
-            if field not in data[0]: return False
+            if field not in row:
+                logger.error(f"Missing required field '{field}' in image preference stats")
+                return False
+            if row[field] is None:
+                logger.warning(f"Null value in field '{field}' in image preference stats")
+        
+        # Enhanced data quality checks
+        total_count = row.get("total_image_count", 0)
+        response_count = row.get("response_count", 0)
+        response_rate = row.get("response_rate", 0)
+        
+        if total_count <= 0:
+            logger.warning("Total image count is zero or negative")
+        
+        if response_count > total_count:
+            logger.error(f"Response count {response_count} exceeds total count {total_count}")
+            return False
+        
+        if not 0 <= response_rate <= 100:
+            logger.error(f"Response rate {response_rate} outside valid range 0-100")
+            return False
+        
+        if response_rate < 30:
+            logger.warning(f"Low response rate in image preferences: {response_rate}%")
+        
         return True
 
     def _validate_preference_data_query(self, data: List[Dict[str, Any]]) -> bool:
-        """Validate preference data query results."""
-        if data is None: return False
-        if not data: return True
+        """Enhanced validation for preference data query results."""
+        if data is None: 
+            logger.warning("Preference data query returned None")
+            return False
+        if not data: 
+            logger.info("Preference data query returned empty result - may indicate missing preference analysis")
+            return True
         
         required_fields = ["preference_name", "question_count", "response_rate", "rank", "description"]
-        for row in data:
+        
+        for i, row in enumerate(data):
             for field in required_fields:
-                if field not in row: return False
+                if field not in row:
+                    logger.error(f"Missing required field '{field}' in preference data row {i+1}")
+                    return False
+                if row[field] is None or (isinstance(row[field], str) and row[field].strip() == ""):
+                    logger.warning(f"Empty value in field '{field}' in preference data row {i+1}")
+            
+            # Enhanced data quality checks
+            rank = row.get("rank")
+            if rank is not None and (not isinstance(rank, int) or rank < 1 or rank > 3):
+                logger.error(f"Invalid rank {rank} in preference data row {i+1}, expected 1-3")
+                return False
+            
+            response_rate = row.get("response_rate")
+            if response_rate is not None:
+                if not isinstance(response_rate, (int, float)) or not 0 <= response_rate <= 100:
+                    logger.error(f"Invalid response rate {response_rate} in preference data row {i+1}")
+                    return False
+                elif response_rate < 30:
+                    logger.warning(f"Low response rate {response_rate}% in preference data row {i+1}")
+        
+        if len(data) < 3:
+            logger.warning(f"Expected 3 top preferences, got {len(data)}")
+        
         return True
 
     def _validate_preference_jobs_query(self, data: List[Dict[str, Any]]) -> bool:
-        """Validate preference jobs query results."""
-        if data is None: return False
-        if not data: return True
+        """Enhanced validation for preference jobs query results."""
+        if data is None: 
+            logger.warning("Preference jobs query returned None")
+            return False
+        if not data: 
+            logger.info("Preference jobs query returned empty result - may indicate missing job recommendations")
+            return True
         
         required_fields = ["preference_name", "preference_type", "jo_name", "jo_outline", "jo_mainbusiness", "majors"]
-        for row in data:
+        expected_types = {"rimg1", "rimg2", "rimg3"}
+        found_types = set()
+        
+        for i, row in enumerate(data):
             for field in required_fields:
-                if field not in row: return False
-            if row.get("preference_type") not in ["rimg1", "rimg2", "rimg3"]: return False
+                if field not in row:
+                    logger.error(f"Missing required field '{field}' in preference jobs row {i+1}")
+                    return False
+                if row[field] is None or (isinstance(row[field], str) and row[field].strip() == ""):
+                    logger.warning(f"Empty value in field '{field}' in preference jobs row {i+1}")
+            
+            # Enhanced preference type validation
+            pref_type = row.get("preference_type")
+            if pref_type:
+                found_types.add(pref_type)
+                if pref_type not in expected_types:
+                    logger.error(f"Invalid preference type '{pref_type}' in row {i+1}")
+                    return False
+        
+        # Check for missing preference types
+        missing_types = expected_types - found_types
+        if missing_types:
+            logger.warning(f"Missing preference types in jobs data: {', '.join(missing_types)}")
+        
+        # Check job distribution per preference type
+        jobs_per_type = {}
+        for row in data:
+            pref_type = row.get("preference_type")
+            if pref_type:
+                jobs_per_type[pref_type] = jobs_per_type.get(pref_type, 0) + 1
+        
+        for pref_type, job_count in jobs_per_type.items():
+            if job_count < 3:
+                logger.warning(f"Low job count for preference type {pref_type}: {job_count}")
+        
         return True
 
     # ▼▼▼ [5단계: 추가된 유효성 검사 메소드] ▼▼▼
@@ -1303,17 +2264,74 @@ class LegacyQueryExecutor:
                 
         return cleaned_data
     
+    async def diagnose_preference_queries_async(self, session: Session, anp_seq: int) -> PreferenceDataReport:
+        """
+        Async wrapper for preference query diagnostics
+        """
+        def run_diagnostics():
+            queries = AptitudeTestQueries(session)
+            return queries.diagnose_preference_queries(anp_seq)
+        
+        try:
+            report = await asyncio.get_event_loop().run_in_executor(
+                self.executor, run_diagnostics
+            )
+            return report
+        except Exception as e:
+            logger.error(f"Failed to run preference diagnostics for anp_seq {anp_seq}: {e}")
+            # Return empty report on failure
+            return PreferenceDataReport(
+                anp_seq=anp_seq,
+                total_queries=3,
+                successful_queries=0,
+                failed_queries=3,
+                total_execution_time=0.0,
+                data_availability={
+                    "imagePreferenceStatsQuery": False,
+                    "preferenceDataQuery": False,
+                    "preferenceJobsQuery": False
+                },
+                diagnostics=[],
+                recommendations=["Failed to execute preference diagnostics"]
+            )
+
     async def _execute_single_query_with_retry(
         self, 
         session: Session, 
         anp_seq: int, 
         query_name: str
     ) -> QueryResult:
-        """Execute a single query with retry logic"""
+        """Execute a single query with enhanced retry logic and error handling"""
         
-        for attempt in range(self.max_retries + 1):
+        # Check if this is a preference query for enhanced logging
+        is_preference_query = query_name in ["imagePreferenceStatsQuery", "preferenceDataQuery", "preferenceJobsQuery"]
+        
+        # Enhanced retry configuration for preference queries
+        max_retries = self.max_retries + 2 if is_preference_query else self.max_retries
+        base_delay = 1.0 if is_preference_query else self.retry_delay
+        
+        last_exception = None
+        connection_errors = 0
+        timeout_errors = 0
+        validation_errors = 0
+        
+        for attempt in range(max_retries + 1):
             start_time = datetime.now()
-            logger.info(f"Query '{query_name}' attempting to execute (attempt {attempt + 1})")
+            logger.info(f"Query '{query_name}' attempting to execute (attempt {attempt + 1}/{max_retries + 1})")
+            
+            if is_preference_query:
+                preference_logger.info(
+                    "Starting preference query execution with enhanced retry",
+                    anp_seq=anp_seq,
+                    query_name=query_name,
+                    attempt=attempt + 1,
+                    max_attempts=max_retries + 1,
+                    connection_errors=connection_errors,
+                    timeout_errors=timeout_errors,
+                    validation_errors=validation_errors,
+                    timestamp=start_time.isoformat()
+                )
+            
             try:
                 loop = asyncio.get_event_loop()
 
@@ -1329,28 +2347,90 @@ class LegacyQueryExecutor:
                     )
                 except asyncio.TimeoutError:
                     execution_time = (datetime.now() - start_time).total_seconds()
+                    timeout_errors += 1
+                    last_exception = PreferenceQueryTimeoutError(query_name, self.query_timeout)
+                    
                     logger.error(f"Query '{query_name}' timed out after {self.query_timeout}s")
-                    if attempt < self.max_retries:
-                        wait_time = self.retry_delay * (2 ** attempt)
-                        logger.warning(f"Retrying '{query_name}' in {wait_time}s due to timeout (attempt {attempt + 1}/{self.max_retries + 1})")
+                    
+                    if is_preference_query:
+                        preference_logger.error(
+                            "Preference query timeout",
+                            anp_seq=anp_seq,
+                            query_name=query_name,
+                            attempt=attempt + 1,
+                            execution_time=execution_time,
+                            timeout_seconds=self.query_timeout,
+                            timeout_errors=timeout_errors,
+                            timestamp=datetime.now().isoformat()
+                        )
+                    
+                    if attempt < max_retries:
+                        # Exponential backoff with jitter for timeouts
+                        wait_time = base_delay * (2 ** attempt) + random.uniform(0.1, 0.5)
+                        logger.warning(f"Retrying '{query_name}' in {wait_time:.2f}s due to timeout (attempt {attempt + 1}/{max_retries + 1})")
+                        
+                        if is_preference_query:
+                            preference_logger.info(
+                                "Retrying preference query after timeout",
+                                anp_seq=anp_seq,
+                                query_name=query_name,
+                                attempt=attempt + 1,
+                                retry_delay=wait_time,
+                                timeout_errors=timeout_errors,
+                                timestamp=datetime.now().isoformat()
+                            )
+                        
                         await asyncio.sleep(wait_time)
                         continue
                     else:
                         return QueryResult(
                             query_name=query_name,
                             success=False,
-                            error=f"timeout after {self.query_timeout}s",
+                            error=f"timeout after {self.query_timeout}s (attempts: {max_retries + 1}, timeouts: {timeout_errors})",
                             execution_time=execution_time,
                         )
                 execution_time = (datetime.now() - start_time).total_seconds()
                 
                 cleaned_data = self._clean_query_data(query_name, data)
                 
-                if not self._validate_query_result(query_name, cleaned_data):
-                    raise QueryValidationError(
-                        query_name, 
-                        f"Query result validation failed for {query_name}"
+                # Enhanced logging for preference queries
+                if is_preference_query:
+                    data_quality_score = None
+                    validation_issues = []
+                    
+                    if cleaned_data:
+                        # Calculate data quality for preference queries
+                        aptitude_queries = AptitudeTestQueries(session)
+                        data_quality_score = aptitude_queries._calculate_data_quality_score(query_name, cleaned_data)
+                        validation_issues = aptitude_queries._identify_validation_issues(query_name, cleaned_data)
+                    
+                    preference_logger.info(
+                        "Preference query execution completed",
+                        anp_seq=anp_seq,
+                        query_name=query_name,
+                        attempt=attempt + 1,
+                        success=True,
+                        execution_time=execution_time,
+                        row_count=len(cleaned_data),
+                        has_data=len(cleaned_data) > 0,
+                        data_quality_score=data_quality_score,
+                        validation_issues=validation_issues,
+                        timestamp=datetime.now().isoformat()
                     )
+                
+                if not self._validate_query_result(query_name, cleaned_data):
+                    validation_error = f"Query result validation failed for {query_name}"
+                    
+                    if is_preference_query:
+                        preference_logger.warning(
+                            "Preference query validation failed",
+                            anp_seq=anp_seq,
+                            query_name=query_name,
+                            validation_error=validation_error,
+                            timestamp=datetime.now().isoformat()
+                        )
+                    
+                    raise QueryValidationError(query_name, validation_error)
                 
                 logger.info(
                     f"Query '{query_name}' executed successfully in {execution_time:.2f}s, "
@@ -1365,21 +2445,141 @@ class LegacyQueryExecutor:
                     row_count=len(cleaned_data)
                 )
                 
-            except Exception as e:
+            except (DisconnectionError, OperationalError, SQLTimeoutError) as e:
+                # Database connection/operational errors - enhanced retry logic
                 execution_time = (datetime.now() - start_time).total_seconds()
+                connection_errors += 1
+                last_exception = PreferenceQueryConnectionError(query_name, e)
                 
-                if attempt < self.max_retries:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    logger.warning(
-                        f"Query '{query_name}' failed on attempt {attempt + 1}/{self.max_retries + 1}: {e}. "
-                        f"Retrying in {wait_time}s..."
+                logger.warning(f"Query '{query_name}' connection error: {type(e).__name__}: {e}")
+                
+                if is_preference_query:
+                    preference_logger.warning(
+                        "Preference query connection error",
+                        anp_seq=anp_seq,
+                        query_name=query_name,
+                        attempt=attempt + 1,
+                        execution_time=execution_time,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                        connection_errors=connection_errors,
+                        timestamp=datetime.now().isoformat()
                     )
+                
+                if attempt < max_retries:
+                    # Exponential backoff with jitter for connection errors
+                    wait_time = base_delay * (2 ** attempt) + random.uniform(0.2, 1.0)
+                    logger.warning(
+                        f"Retrying '{query_name}' in {wait_time:.2f}s due to connection error "
+                        f"(attempt {attempt + 1}/{max_retries + 1})"
+                    )
+                    
+                    if is_preference_query:
+                        preference_logger.info(
+                            "Retrying preference query after connection error",
+                            anp_seq=anp_seq,
+                            query_name=query_name,
+                            attempt=attempt + 1,
+                            retry_delay=wait_time,
+                            connection_errors=connection_errors,
+                            timestamp=datetime.now().isoformat()
+                        )
+                    
                     await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    return QueryResult(
+                        query_name=query_name,
+                        success=False,
+                        error=f"Connection error after {max_retries + 1} attempts: {str(e)}",
+                        execution_time=execution_time
+                    )
+                    
+            except QueryValidationError as e:
+                # Validation errors - don't retry, return immediately
+                execution_time = (datetime.now() - start_time).total_seconds()
+                validation_errors += 1
+                
+                logger.error(f"Query '{query_name}' validation failed: {e.validation_error}")
+                
+                if is_preference_query:
+                    preference_logger.error(
+                        "Preference query validation error",
+                        anp_seq=anp_seq,
+                        query_name=query_name,
+                        attempt=attempt + 1,
+                        execution_time=execution_time,
+                        validation_error=e.validation_error,
+                        validation_errors=validation_errors,
+                        timestamp=datetime.now().isoformat()
+                    )
+                
+                return QueryResult(
+                    query_name=query_name,
+                    success=False,
+                    error=f"Validation failed: {e.validation_error}",
+                    execution_time=execution_time
+                )
+                
+            except Exception as e:
+                # Other unexpected errors
+                execution_time = (datetime.now() - start_time).total_seconds()
+                last_exception = e
+                
+                logger.error(f"Query '{query_name}' unexpected error: {type(e).__name__}: {e}")
+                
+                if is_preference_query:
+                    preference_logger.error(
+                        "Preference query unexpected error",
+                        anp_seq=anp_seq,
+                        query_name=query_name,
+                        attempt=attempt + 1,
+                        execution_time=execution_time,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                        traceback=traceback.format_exc(),
+                        timestamp=datetime.now().isoformat()
+                    )
+                
+                if attempt < max_retries:
+                    # Shorter delay for unexpected errors
+                    wait_time = base_delay * 0.5 * (attempt + 1)
+                    logger.warning(
+                        f"Retrying '{query_name}' in {wait_time:.2f}s due to unexpected error "
+                        f"(attempt {attempt + 1}/{max_retries + 1}): {e}"
+                    )
+                    
+                    if is_preference_query:
+                        preference_logger.info(
+                            "Retrying preference query after unexpected error",
+                            anp_seq=anp_seq,
+                            query_name=query_name,
+                            attempt=attempt + 1,
+                            retry_delay=wait_time,
+                            timestamp=datetime.now().isoformat()
+                        )
+                    
+                    await asyncio.sleep(wait_time)
+                    continue
                 else:
                     logger.error(
-                        f"Query '{query_name}' failed after {self.max_retries + 1} attempts: {e}\n"
+                        f"Query '{query_name}' failed after {max_retries + 1} attempts: {e}\n"
                         f"Traceback: {traceback.format_exc()}"
                     )
+                    
+                    if is_preference_query:
+                        preference_logger.error(
+                            "Preference query failed after all retries",
+                            anp_seq=anp_seq,
+                            query_name=query_name,
+                            total_attempts=max_retries + 1,
+                            connection_errors=connection_errors,
+                            timeout_errors=timeout_errors,
+                            validation_errors=validation_errors,
+                            final_error=str(e),
+                            traceback=traceback.format_exc(),
+                            timestamp=datetime.now().isoformat()
+                        )
                     
                     return QueryResult(
                         query_name=query_name,

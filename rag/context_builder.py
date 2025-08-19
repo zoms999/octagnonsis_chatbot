@@ -27,6 +27,9 @@ class PromptTemplate(Enum):
     THINKING_SKILLS_COMPARE = "thinking_skills_compare"
     LEARNING_STYLE_RECOMMEND = "learning_style_recommend"
     COMPETENCY_ANALYZE = "competency_analyze"
+    PREFERENCE_EXPLAIN = "preference_explain"
+    PREFERENCE_MISSING = "preference_missing"
+    PREFERENCE_PARTIAL = "preference_partial"
     GENERAL_COMPARE = "general_compare"
     STATISTICAL_INFO = "statistical_info"
     FOLLOW_UP = "follow_up"
@@ -165,6 +168,39 @@ class ContextBuilder:
 위 결과를 바탕으로 사용자의 상위 5개 재능과 역량을 분석하고, 이를 어떻게 활용할 수 있는지 구체적으로 설명해주세요.
 """,
             
+            PromptTemplate.PREFERENCE_EXPLAIN: """
+당신은 이미지 선호도 분석 전문가입니다. 사용자의 선호도 검사 결과를 바탕으로 설명해주세요.
+
+사용자 질문: {question}
+
+관련 검사 결과:
+{context_documents}
+
+위 결과를 바탕으로 사용자의 이미지 선호 패턴, 관심 영역, 그리고 이것이 진로나 활동 선택에 어떤 의미를 갖는지 친근하게 설명해주세요. 선호도가 높은 영역과 관련된 직업이나 활동도 함께 제안해주세요.
+""",
+            
+            PromptTemplate.PREFERENCE_MISSING: """
+당신은 적성검사 상담 전문가입니다. 사용자가 선호도 분석에 대해 질문했지만 해당 데이터가 없는 상황입니다.
+
+사용자 질문: {question}
+
+현재 상황:
+{context_documents}
+
+선호도 분석 데이터가 현재 준비되지 않았음을 친근하게 안내하고, 대신 활용할 수 있는 다른 검사 결과(성격 분석, 사고능력, 역량 분석 등)를 바탕으로 사용자의 관심사나 적성을 파악할 수 있는 방법을 제안해주세요. 또한 선호도와 유사한 정보를 얻을 수 있는 다른 질문 방향도 안내해주세요.
+""",
+            
+            PromptTemplate.PREFERENCE_PARTIAL: """
+당신은 이미지 선호도 분석 전문가입니다. 사용자의 선호도 검사 결과가 부분적으로만 준비된 상황입니다.
+
+사용자 질문: {question}
+
+부분적으로 준비된 검사 결과:
+{context_documents}
+
+현재 준비된 선호도 데이터를 바탕으로 가능한 분석을 제공하되, 어떤 부분이 아직 준비되지 않았는지 명확히 안내해주세요. 준비된 데이터만으로도 의미 있는 인사이트를 제공하고, 완전한 분석을 위해 필요한 추가 정보나 다른 검사 결과 활용 방법을 제안해주세요.
+""",
+            
             PromptTemplate.GENERAL_COMPARE: """
 당신은 적성검사 분석 전문가입니다. 사용자의 전반적인 검사 결과를 비교 분석해주세요.
 
@@ -234,8 +270,8 @@ class ContextBuilder:
                 processed_question, user_id
             )
             
-            # Select appropriate prompt template
-            template = self._select_prompt_template(processed_question)
+            # Select appropriate prompt template (considering preference document availability)
+            template = self._select_prompt_template_with_context(processed_question, retrieved_docs)
             
             # Format context documents for prompt
             formatted_docs = self._format_documents_for_prompt(retrieved_docs)
@@ -519,6 +555,98 @@ class ContextBuilder:
             self.logger.warning(f"Error creating content summary: {e}")
             return document.summary_text[:150] + "..." if document.summary_text else "검사 결과 데이터"
     
+    def _analyze_preference_document_availability(self, retrieved_docs: List[RetrievedDocument]) -> Tuple[bool, bool, str]:
+        """
+        Analyze availability and completeness of preference documents.
+        
+        Args:
+            retrieved_docs: List of retrieved documents
+            
+        Returns:
+            Tuple of (has_preference_docs, is_complete, availability_status)
+        """
+        preference_docs = [doc for doc in retrieved_docs if doc.document.doc_type == "PREFERENCE_ANALYSIS"]
+        
+        if not preference_docs:
+            return False, False, "missing"
+        
+        # Check for completion indicators in document metadata or content
+        complete_indicators = 0
+        partial_indicators = 0
+        
+        for doc in preference_docs:
+            try:
+                content = json.loads(doc.document.content) if isinstance(doc.document.content, str) else doc.document.content
+                metadata = doc.document.metadata or {}
+                
+                # Check completion level in metadata
+                completion_level = metadata.get("completion_level", "")
+                if completion_level == "complete":
+                    complete_indicators += 1
+                elif completion_level in ["partial", "incomplete"]:
+                    partial_indicators += 1
+                
+                # Check for fallback or missing data indicators in content
+                if isinstance(content, dict):
+                    if content.get("completion_status") == "완료":
+                        complete_indicators += 1
+                    elif "데이터 준비 중" in str(content) or "일부 데이터" in str(content):
+                        partial_indicators += 1
+                    elif "데이터를 찾을 수 없습니다" in str(content):
+                        partial_indicators += 1
+                
+                # Check summary text for indicators
+                summary = doc.document.summary_text or ""
+                if "데이터 준비 중" in summary or "일부만 준비" in summary:
+                    partial_indicators += 1
+                elif "완료" in summary and "분석" in summary:
+                    complete_indicators += 1
+                    
+            except Exception as e:
+                self.logger.warning(f"Error analyzing preference document: {e}")
+                partial_indicators += 1
+        
+        # Determine overall status
+        if complete_indicators > 0 and partial_indicators == 0:
+            return True, True, "complete"
+        elif partial_indicators > 0:
+            return True, False, "partial"
+        else:
+            # Has documents but unclear status - assume partial
+            return True, False, "partial"
+
+    def _select_prompt_template_with_context(self, processed_question: ProcessedQuestion, retrieved_docs: List[RetrievedDocument]) -> PromptTemplate:
+        """
+        Select appropriate prompt template considering document availability.
+        
+        Args:
+            processed_question: Processed user question
+            retrieved_docs: Retrieved documents
+            
+        Returns:
+            Selected prompt template
+        """
+        category = processed_question.category
+        intent = processed_question.intent
+        
+        # Handle follow-up questions first
+        if intent == QuestionIntent.FOLLOW_UP:
+            return PromptTemplate.FOLLOW_UP
+        
+        # Special handling for preference analysis questions
+        if category == QuestionCategory.PREFERENCE_ANALYSIS:
+            has_docs, is_complete, status = self._analyze_preference_document_availability(retrieved_docs)
+            
+            if not has_docs or status == "missing":
+                return PromptTemplate.PREFERENCE_MISSING
+            elif status == "partial":
+                return PromptTemplate.PREFERENCE_PARTIAL
+            else:
+                return PromptTemplate.PREFERENCE_EXPLAIN
+        
+        # Use the original template selection for other categories
+        return self._select_prompt_template(processed_question)
+
     def _select_prompt_template(self, processed_question: ProcessedQuestion) -> PromptTemplate:
         """
         Select appropriate prompt template based on question analysis.
@@ -546,6 +674,9 @@ class ContextBuilder:
             (QuestionCategory.THINKING_SKILLS, QuestionIntent.COMPARE): PromptTemplate.THINKING_SKILLS_COMPARE,
             (QuestionCategory.LEARNING_STYLE, QuestionIntent.RECOMMEND): PromptTemplate.LEARNING_STYLE_RECOMMEND,
             (QuestionCategory.COMPETENCY_ANALYSIS, QuestionIntent.ANALYZE): PromptTemplate.COMPETENCY_ANALYZE,
+            (QuestionCategory.PREFERENCE_ANALYSIS, QuestionIntent.EXPLAIN): PromptTemplate.PREFERENCE_EXPLAIN,
+            (QuestionCategory.PREFERENCE_ANALYSIS, QuestionIntent.ANALYZE): PromptTemplate.PREFERENCE_EXPLAIN,
+            (QuestionCategory.PREFERENCE_ANALYSIS, QuestionIntent.RECOMMEND): PromptTemplate.PREFERENCE_EXPLAIN,
             (QuestionCategory.GENERAL_COMPARISON, QuestionIntent.COMPARE): PromptTemplate.GENERAL_COMPARE,
             (QuestionCategory.STATISTICAL_INFO, QuestionIntent.EXPLAIN): PromptTemplate.STATISTICAL_INFO,
         }
@@ -566,8 +697,22 @@ class ContextBuilder:
             return "관련 검사 결과를 찾을 수 없습니다. 적성검사를 완료하셨는지 확인해 주세요."
         
         formatted_parts = []
+        preference_docs = []
+        other_docs = []
         
-        for i, doc in enumerate(retrieved_docs, 1):
+        # Separate preference documents from others
+        for doc in retrieved_docs:
+            if doc.document.doc_type == "PREFERENCE_ANALYSIS":
+                preference_docs.append(doc)
+            else:
+                other_docs.append(doc)
+        
+        # Format preference documents with special handling
+        if preference_docs:
+            formatted_parts.append(self._format_preference_documents(preference_docs))
+        
+        # Format other documents normally
+        for i, doc in enumerate(other_docs, len(preference_docs) + 1):
             doc_section = f"\n=== 검사 결과 {i}: {doc.document.doc_type} ===\n"
             doc_section += f"요약: {doc.content_summary}\n"
             
@@ -581,6 +726,75 @@ class ContextBuilder:
                 content = json.loads(doc.document.content) if isinstance(doc.document.content, str) else doc.document.content
                 doc_section += f"\n상세 데이터:\n{json.dumps(content, ensure_ascii=False, indent=2)}\n"
             except:
+                doc_section += f"\n상세 내용: {doc.document.summary_text}\n"
+            
+            formatted_parts.append(doc_section)
+        
+        return "\n".join(formatted_parts)
+    
+    def _format_preference_documents(self, preference_docs: List[RetrievedDocument]) -> str:
+        """
+        Format preference documents with special handling for missing/partial data.
+        
+        Args:
+            preference_docs: List of preference documents
+            
+        Returns:
+            Formatted preference document string
+        """
+        if not preference_docs:
+            return ""
+        
+        formatted_parts = []
+        
+        for i, doc in enumerate(preference_docs, 1):
+            doc_section = f"\n=== 선호도 분석 결과 {i} ===\n"
+            doc_section += f"요약: {doc.content_summary}\n"
+            
+            try:
+                content = json.loads(doc.document.content) if isinstance(doc.document.content, str) else doc.document.content
+                metadata = doc.document.metadata or {}
+                
+                # Check completion status
+                completion_level = metadata.get("completion_level", "unknown")
+                sub_type = metadata.get("sub_type", "")
+                
+                doc_section += f"데이터 상태: {completion_level}\n"
+                if sub_type:
+                    doc_section += f"분석 유형: {sub_type}\n"
+                
+                # Add availability information for partial/missing data
+                if completion_level in ["partial", "incomplete"]:
+                    doc_section += "\n⚠️ 주의: 이 분석은 부분적인 데이터를 바탕으로 합니다.\n"
+                    
+                    # Check what data is available
+                    if isinstance(content, dict):
+                        available_components = []
+                        if content.get("stats"):
+                            available_components.append("통계 데이터")
+                        if content.get("preferences"):
+                            available_components.append("선호도 데이터")
+                        if content.get("jobs"):
+                            available_components.append("직업 추천 데이터")
+                        
+                        if available_components:
+                            doc_section += f"사용 가능한 데이터: {', '.join(available_components)}\n"
+                
+                elif "데이터 준비 중" in str(content) or "찾을 수 없습니다" in str(content):
+                    doc_section += "\n❌ 선호도 분석 데이터가 현재 준비되지 않았습니다.\n"
+                    doc_section += "대신 다른 검사 결과(성격, 사고능력, 역량 분석)를 활용할 수 있습니다.\n"
+                
+                # Add key points
+                if doc.key_points:
+                    doc_section += "\n주요 내용:\n"
+                    for point in doc.key_points:
+                        doc_section += f"- {point}\n"
+                
+                # Add content details
+                doc_section += f"\n상세 데이터:\n{json.dumps(content, ensure_ascii=False, indent=2)}\n"
+                
+            except Exception as e:
+                self.logger.warning(f"Error formatting preference document: {e}")
                 doc_section += f"\n상세 내용: {doc.document.summary_text}\n"
             
             formatted_parts.append(doc_section)
