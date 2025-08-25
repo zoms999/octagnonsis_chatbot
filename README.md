@@ -1,97 +1,64 @@
-# AI 적성 분석 챗봇 Frontend
+# Octag AI 챗봇 백엔드 시스템
 
-Next.js 기반의 AI 적성 분석 챗봇 웹 애플리케이션입니다.
+## 프로젝트 개요
 
-## 기술 스택
+Octag AI 챗봇 백엔드 시스템은 지능적이고 반응성이 뛰어난 사용자 상호작용을 제공하기 위해 설계된 **AI 기반 챗봇 플랫폼**입니다. 단순한 채팅 인터페이스를 넘어, 엔터프라이즈 환경의 요구사항을 충족하는 강력하고 확장 가능한 백엔드 솔루션을 제공하는 것을 목표로 합니다.
 
-- **Framework**: Next.js 14+ (App Router)
-- **Language**: TypeScript
-- **Styling**: Tailwind CSS
-- **State Management**: React Query + React Context
-- **Real-time**: WebSocket + Server-Sent Events
+본 시스템은 **마이크로서비스 지향 아키텍처**를 채택하여, 인증, 채팅, ETL, RAG, 모니터링 등 각 기능이 독립적으로 개발 및 배포될 수 있도록 설계되었습니다. 이러한 구조는 시스템의 **확장성과 유지보수성**을 높여주며, 복잡한 데이터 처리 및 외부 시스템 연동 작업을 효율적으로 처리할 수 있게 합니다.
 
-## 시작하기
-
-### 필수 요구사항
-
-- Node.js 18.0.0 이상
-- npm 또는 yarn
-
-### 설치
-
-1. 의존성 설치:
-```bash
-npm install
-```
-
-2. 환경 변수 설정:
-```bash
-cp .env.example .env.local
-```
-
-3. 개발 서버 실행:
-```bash
-npm run dev
-```
-
-4. 브라우저에서 [http://localhost:3000](http://localhost:3000) 접속
-
-## 프로젝트 구조
-
-```
-src/
-├── app/                    # Next.js App Router 페이지
-│   ├── (auth)/            # 인증 관련 페이지
-│   ├── (protected)/       # 보호된 페이지
-│   ├── layout.tsx         # 루트 레이아웃
-│   └── globals.css        # 글로벌 스타일
-├── components/            # 재사용 가능한 컴포넌트
-│   ├── ui/               # 기본 UI 컴포넌트
-│   ├── auth/             # 인증 컴포넌트
-│   ├── chat/             # 채팅 관련 컴포넌트
-│   ├── etl/              # ETL 모니터링 컴포넌트
-│   └── layout/           # 레이아웃 컴포넌트
-├── lib/                  # 유틸리티 및 설정
-├── hooks/                # 커스텀 React 훅
-└── providers/            # Context 프로바이더
-```
+특히, 데이터의 정확성, 보안, 안정적인 모니터링이 중요한 **엔터프라이즈 환경**에 최적화되어 있으며, 강력한 ETL 파이프라인과 RAG 기반의 질의응답 시스템을 통해 높은 수준의 데이터 처리 능력과 지능적인 대화 능력을 제공합니다.
 
 ## 주요 기능
 
-- 🔐 **사용자 인증**: 개인/조직 로그인 지원
-- 💬 **실시간 채팅**: WebSocket 기반 AI 채팅
-- 📊 **ETL 모니터링**: 데이터 처리 상태 실시간 추적
-- 📝 **대화 기록**: 이전 대화 내용 조회
-- 👤 **프로필 관리**: 사용자 정보 및 문서 관리
-- 📱 **반응형 디자인**: 모바일/태블릿/데스크톱 지원
+### 1. 사용자 인증 (User Authentication)
 
-## 개발 스크립트
+- JWT (JSON Web Token) 기반의 안전한 사용자 인증 시스템을 제공합니다.
+- 토큰 발급, 재발급, 검증을 통해 인가된 사용자만 서비스에 접근할 수 있도록 제어합니다.
+
+### 2. 실시간 채팅 (Real-time Chat)
+
+- WebSocket을 활용하여 사용자와 서버 간의 실시간 양방향 통신을 지원합니다.
+- 사용자의 메시지를 신속하게 처리하고 답변을 전송하여 원활한 대화 경험을 제공합니다.
+
+### 3. ETL 파이프라인 (ETL Pipeline)
+
+- 다양한 소스로부터 데이터를 추출(Extract), 변환(Transform), 적재(Load)하는 강력한 ETL 파이프라인을 갖추고 있습니다.
+- 데이터 정제, 형식 변환, 벡터 임베딩 등 복잡한 데이터 처리 작업을 자동화하고 관리합니다.
+- ETL 작업의 상태를 모니터링하고 오류 발생 시 신속하게 대응할 수 있는 기능을 포함합니다.
+
+### 4. RAG (Retrieval-Augmented Generation) 기반 질의응답
+
+- RAG 기술을 도입하여, 방대한 데이터베이스에서 사용자의 질문과 관련된 정보를 신속하게 검색하고, 이를 바탕으로 정확하고 문맥에 맞는 답변을 생성합니다.
+- 벡터 검색(Vector Search)을 통해 의미적으로 유사한 문서를 효율적으로 찾아내어 답변의 질을 높입니다.
+
+### 5. 관리자 및 사용자 설정 (Admin & User Preferences)
+
+- 관리자가 시스템의 주요 설정을 변경하고 모니터링할 수 있는 관리자 기능을 제공합니다.
+- 사용자별 맞춤 설정을 저장하고 관리하여 개인화된 챗봇 경험을 제공합니다.
+
+### 6. 모니터링 및 알림 (Monitoring & Alerting)
+
+- 시스템의 주요 지표(Metric)를 실시간으로 수집하고 모니터링합니다.
+- 시스템에 이상이 발생하거나 특정 조건이 충족될 경우, 관리자에게 알림을 보내 신속한 대응을 가능하게 합니다.
+
+## 기술 스택
+
+- **언어:** Python
+- **프레임워크:** FastAPI (예상)
+- **데이터베이스:** PostgreSQL (예상, Vector DB 기능 포함)
+- **실시간 통신:** WebSockets
+- **인증:** JWT
+
+## API 엔드포인트
+
+- **Auth Endpoints:** `/api/auth/...` (로그인, 회원가입, 토큰 재발급 등)
+- **Chat Endpoints:** `/api/chat/...` (채팅 메시지 전송 및 내역 관리)
+- **ETL Endpoints:** `/api/etl/...` (ETL 작업 실행 및 상태 확인)
+- **Admin/Preference Endpoints:** `/api/admin/...`, `/api/preferences/...` (관리자 기능 및 사용자 설정)
+- **Monitoring Endpoints:** `/api/monitoring/...` (시스템 모니터링 데이터 조회)
+
+## 실행 방법
 
 ```bash
-# 개발 서버 실행
-npm run dev
-
-# 프로덕션 빌드
-npm run build
-
-# 프로덕션 서버 실행
-npm run start
-
-# 린팅
-npm run lint
-
-# 타입 체크
-npm run type-check
+# (추후 실행 방법 추가)
 ```
-
-## 환경 변수
-
-| 변수명 | 설명 | 기본값 |
-|--------|------|--------|
-| `NEXT_PUBLIC_API_BASE` | API 서버 URL | `http://localhost:8000` |
-| `NEXT_PUBLIC_WS_BASE` | WebSocket 서버 URL | `ws://localhost:8000` |
-| `NEXT_PUBLIC_ADMIN_TOKEN` | 관리자 토큰 (선택사항) | - |
-
-## 라이센스
-
-이 프로젝트는 MIT 라이센스 하에 배포됩니다.
