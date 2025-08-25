@@ -41,6 +41,13 @@ Octag AI 챗봇 백엔드 시스템은 지능적이고 반응성이 뛰어난 �
 - 시스템의 주요 지표(Metric)를 실시간으로 수집하고 모니터링합니다.
 - 시스템에 이상이 발생하거나 특정 조건이 충족될 경우, 관리자에게 알림을 보내 신속한 대응을 가능하게 합니다.
 
+### 7. 챗봇 테스트용 프론트엔드 (Frontend for Chatbot Testing)
+
+- 백엔드 챗봇의 기능을 테스트하고 상호작용할 수 있는 프론트엔드 애플리케이션이 `front` 디렉터리에 포함되어 있습니다.
+- **Next.js**와 **React** 기반으로 구축되었으며, 백엔드 API와 WebSocket을 통해 실시간으로 통신합니다.
+- 로그인, 채팅, 디버깅 등 다양한 테스트를 위한 컴포넌트와 유틸리티를 포함하고 있습니다.
+- 루트 디렉터리의 `test-login.html` 파일을 통해 간단하게 로그인 기능을 테스트해볼 수도 있습니다.
+
 ## 기술 스택
 
 - **언어:** Python
@@ -59,6 +66,50 @@ Octag AI 챗봇 백엔드 시스템은 지능적이고 반응성이 뛰어난 �
 
 ## 실행 방법
 
+**참고:** 아래의 실행 방법은 프로젝트 구조를 바탕으로 추론한 것이며, 실제 환경에 따라 일부 명령어는 수정이 필요할 수 있습니다.
+
+### 1. 백엔드 설정 및 실행
+
+**가. 가상 환경 생성 및 활성화**
 ```bash
-# (추후 실행 방법 추가)
+python -m venv venv
+source venv/bin/activate  # Linux/macOS
+.\venv\Scripts\activate  # Windows
 ```
+
+**나. 의존성 설치**
+```bash
+pip install -r requirements.txt
+pip install -r etl_requirements.txt
+```
+
+**다. 데이터베이스 마이그레이션**
+```bash
+python run_migration.py
+```
+
+**라. 백엔드 서버 실행**
+
+(FastAPI 애플리케이션으로 가정)
+```bash
+uvicorn main:app --reload
+```
+
+### 2. 프론트엔드 설정 및 실행
+
+**가. 디렉터리 이동**
+```bash
+cd front
+```
+
+**나. 의존성 설치**
+```bash
+npm install
+```
+
+**다. 프론트엔드 개발 서버 실행**
+```bash
+npm run dev
+```
+
+이제 브라우저에서 `http://localhost:3000` (또는 Next.js가 지정한 다른 포트)으로 접속하여 애플리케이션을 확인할 수 있습니다.
