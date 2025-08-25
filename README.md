@@ -27,8 +27,8 @@ Octag AI 챗봇은 사용자의 적성을 분석하고 관련 정보를 제공�
 ### 3.2. 기술 스택
 
 - **Language**: Python
-- **Framework**: FastAPI (예상)
-- **Database**: PostgreSQL (예상, Vector DB 기능 포함)
+- **Framework**: FastAPI 
+- **Database**: PostgreSQL ( Vector DB 기능 포함)
 - **Real-time**: WebSockets
 - **Authentication**: JWT
 
